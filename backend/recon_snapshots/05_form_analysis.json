@@ -1,0 +1,473 @@
+{
+  "url": "https://www.maersk.com/book/",
+  "title": "Maersk Booking",
+  "inputs": [
+    {
+      "tag": "INPUT",
+      "type": "checkbox",
+      "name": "cookie_cat_necessary",
+      "id": "cookie_cat_necessary",
+      "placeholder": "",
+      "ariaLabel": "Essential",
+      "className": "coi__checkbox--necessary",
+      "dataTestId": null,
+      "role": null,
+      "value": "on",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "checkbox",
+      "name": "cookie_cat_functional",
+      "id": "cookie_cat_functional",
+      "placeholder": "",
+      "ariaLabel": "Functional",
+      "className": "coi__checkbox",
+      "dataTestId": null,
+      "role": null,
+      "value": "on",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "checkbox",
+      "name": "cookie_cat_statistic",
+      "id": "cookie_cat_statistic",
+      "placeholder": "",
+      "ariaLabel": "Statistical",
+      "className": "coi__checkbox",
+      "dataTestId": null,
+      "role": null,
+      "value": "on",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "checkbox",
+      "name": "cookie_cat_marketing",
+      "id": "cookie_cat_marketing",
+      "placeholder": "",
+      "ariaLabel": "Marketing",
+      "className": "coi__checkbox",
+      "dataTestId": null,
+      "role": null,
+      "value": "on",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "checkbox",
+      "name": "",
+      "id": "cookie_cat_unclassified",
+      "placeholder": "",
+      "ariaLabel": "Unclassified",
+      "className": "coi__checkbox--unclassified",
+      "dataTestId": null,
+      "role": null,
+      "value": "on",
+      "required": false
+    },
+    {
+      "tag": "TEXTAREA",
+      "type": "textarea",
+      "name": "",
+      "id": "ign-header__search--ai__input",
+      "placeholder": "How can I help?",
+      "ariaLabel": null,
+      "className": "ign-header__search__input ign-header__search--ai__input",
+      "dataTestId": null,
+      "role": null,
+      "value": "",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "text",
+      "name": "",
+      "id": "",
+      "placeholder": "",
+      "ariaLabel": null,
+      "className": "",
+      "dataTestId": null,
+      "role": null,
+      "value": "",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "text",
+      "name": "priceOwner",
+      "id": "",
+      "placeholder": "",
+      "ariaLabel": null,
+      "className": "",
+      "dataTestId": null,
+      "role": null,
+      "value": "",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "text",
+      "name": "",
+      "id": "",
+      "placeholder": "",
+      "ariaLabel": null,
+      "className": "",
+      "dataTestId": null,
+      "role": null,
+      "value": "",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "text",
+      "name": "",
+      "id": "",
+      "placeholder": "",
+      "ariaLabel": null,
+      "className": "",
+      "dataTestId": null,
+      "role": null,
+      "value": "",
+      "required": false
+    },
+    {
+      "tag": "INPUT",
+      "type": "text",
+      "name": "earliestDepartureDatePicker",
+      "id": "",
+      "placeholder": "",
+      "ariaLabel": null,
+      "className": "",
+      "dataTestId": null,
+      "role": null,
+      "value": "null",
+      "required": false
+    }
+  ],
+  "buttons": [
+    {
+      "text": "Manage preferences",
+      "type": "submit",
+      "className": "coi-banner__nextpage",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Essential only",
+      "type": "submit",
+      "className": "coi-banner__decline",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Allow all",
+      "type": "submit",
+      "className": "coi-banner__accept coi-banner__accept",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Save preferences",
+      "type": "submit",
+      "className": "coi-banner__accept coi-banner__save-preferences",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Manage preferences",
+      "type": "submit",
+      "className": "coi-banner__nextpage",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Essential only",
+      "type": "submit",
+      "className": "coi-banner__decline",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Allow all",
+      "type": "submit",
+      "className": "coi-banner__accept coi-banner__accept",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Save preferences",
+      "type": "submit",
+      "className": "coi-banner__accept coi-banner__save-preferences",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Essential only",
+      "type": "submit",
+      "className": "",
+      "dataTestId": null,
+      "disabled": true
+    },
+    {
+      "text": "Allow all",
+      "type": "submit",
+      "className": "",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "More details",
+      "type": "submit",
+      "className": "coi-consent-banner__category-details coi-consent-banner__category-details--slider",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "More details",
+      "type": "submit",
+      "className": "coi-consent-banner__category-details coi-consent-banner__category-details--slider",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "More details",
+      "type": "submit",
+      "className": "coi-consent-banner__category-details coi-consent-banner__category-details--slider",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "More details",
+      "type": "submit",
+      "className": "coi-consent-banner__category-details coi-consent-banner__category-details--slider",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "More details",
+      "type": "submit",
+      "className": "coi-consent-banner__category-details coi-consent-banner__category-details--slider",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Hide preferences",
+      "type": "submit",
+      "className": "coi-banner__lastpage",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Save preferences",
+      "type": "submit",
+      "className": "coi-banner__save-preferences",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Back",
+      "type": "submit",
+      "className": "ign-header__menu__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Close menu",
+      "type": "submit",
+      "className": "ign-header__panel__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Clear",
+      "type": "button",
+      "className": "ign-header__search__clear",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "",
+      "type": "button",
+      "className": "ign-header__search__icon ign-header__search--ai__chat__start",
+      "dataTestId": null,
+      "disabled": true
+    },
+    {
+      "text": "",
+      "type": "button",
+      "className": "ign-header__search__icon ign-header__search--ai__chat__stop ign-header__search__icon--hidden",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "",
+      "type": "button",
+      "className": "ign-header__search--ai__info__result__buttons__feedback__button ign-header__search--ai__info__result__buttons__feedback_",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "",
+      "type": "button",
+      "className": "ign-header__search--ai__info__result__buttons__feedback__button ign-header__search--ai__info__result__buttons__feedback_",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Copy",
+      "type": "button",
+      "className": "ign-header__search--ai__info__result__buttons__button ign-header__search--ai__info__result__copy ign-button-plain",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Redo",
+      "type": "button",
+      "className": "ign-header__search--ai__info__result__buttons__button ign-header__search--ai__info__result__redo ign-button-plain",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Close menu",
+      "type": "submit",
+      "className": "ign-header__panel__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "EN",
+      "type": "submit",
+      "className": "ign-header__panel__language ign-header__panel__menu__toggle",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Back",
+      "type": "submit",
+      "className": "ign-header__panel__menu__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Back",
+      "type": "submit",
+      "className": "ign-header__panel__megamenu__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Back",
+      "type": "submit",
+      "className": "ign-header__panel__megamenu__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Back",
+      "type": "submit",
+      "className": "ign-header__panel__megamenu__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Back",
+      "type": "submit",
+      "className": "ign-header__panel__megamenu__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Close menu",
+      "type": "submit",
+      "className": "ign-header__panel__close",
+      "dataTestId": null,
+      "disabled": false
+    },
+    {
+      "text": "Feedback",
+      "type": "submit",
+      "className": "kampyle_vertical_button kampyle_right  noOutline ",
+      "dataTestId": null,
+      "disabled": false
+    }
+  ],
+  "labels": [
+    {
+      "text": "On",
+      "htmlFor": "",
+      "className": "coi-checkbox-label--on"
+    },
+    {
+      "text": "Off",
+      "htmlFor": "cookie_cat_functional",
+      "className": "coi-checkbox-label--off"
+    },
+    {
+      "text": "On",
+      "htmlFor": "cookie_cat_functional",
+      "className": "coi-checkbox-label--on"
+    },
+    {
+      "text": "Off",
+      "htmlFor": "cookie_cat_statistic",
+      "className": "coi-checkbox-label--off"
+    },
+    {
+      "text": "On",
+      "htmlFor": "cookie_cat_statistic",
+      "className": "coi-checkbox-label--on"
+    },
+    {
+      "text": "Off",
+      "htmlFor": "cookie_cat_marketing",
+      "className": "coi-checkbox-label--off"
+    },
+    {
+      "text": "On",
+      "htmlFor": "cookie_cat_marketing",
+      "className": "coi-checkbox-label--on"
+    },
+    {
+      "text": "On",
+      "htmlFor": "",
+      "className": "coi-checkbox-label--on"
+    }
+  ],
+  "dropdowns": [
+    {
+      "tag": "A",
+      "className": "ign-header__primary__link ign-track  \n            ign-header__primary__link--dropdown \n             \n            ign-hea",
+      "role": null,
+      "ariaLabel": null,
+      "id": "",
+      "dataTestId": null
+    },
+    {
+      "tag": "DIV",
+      "className": "mds-container-select-wrapper",
+      "role": null,
+      "ariaLabel": null,
+      "id": "",
+      "dataTestId": null
+    },
+    {
+      "tag": "A",
+      "className": "select-tomorrow-link mds-text--large-normal mds-link--stand-alone mds-link--disabled",
+      "role": null,
+      "ariaLabel": null,
+      "id": "",
+      "dataTestId": null
+    }
+  ],
+  "datePickers": [
+    {
+      "tag": "DIV",
+      "className": "mds-edd-date-picker",
+      "id": "",
+      "dataTestId": null
+    }
+  ],
+  "allText": "Skip to content\nSkip to footer\nEN\nSearch\nNotifications\n0\nSupport\nContact Us\nPrices\nBook\nSchedules\nTracking\nManage\nServices\nCompany\nYS\nYogesh Shishodia\nEXIM ROUTES PTE LTD\n|\nSG\nHow will your cargo be transported?\nContainers\nBoxes & Pallets\nBooking Information\nSelect sailing\nRecommended services\nAdditional details\nReview booking\nYour booking details\nLocation details\nI want to pick-up the empty container(s) in another city(charges may apply)\nWhat do you want to ship?\nHow will your cargo be shipped?\nWho is the Price Owner?\nWhen is your cargo ready to ship?\nPlease select your earliest departure date, and click continue to book\nSelect tomorrow\nClicking the button takes you to the next step to select your desired sailing and continue with your booking\nSpeed up your booking process by reusing details from a previous booking\nShow previous bookings\nCheck Maersk offers for your next vessel\nPlease enter your location and the container details to see the offers.\nFixed price at booking\nLoading guarantee\nChanges and cancellations possible for a fee\nSpot rate is not applicable for our contract customers\nPlan & Book\nPrices\nBook\nContainer Tracking\nVessel Schedules\nHelp\nLocal Offices & Information\nSupport\nContact Us\nLogistics Services\nOcean Transport\nMaersk Customs Services\nInland Transport\nLead Logistics\nWarehousing\nAir Freight\nE-Commerce Logistics\nLess-than-Container Load (LCL)\nCold Chain Logistics\nMaersk Project Logistics\nDepot\nCold Storage\nMaersk Ground Freight Transport\nDecarbonising Logistics\nValue Protect\nView all\nResources\nNews & Advisories\nIndustry Sectors\nInsights\nLogistics Explained\nQuick Links\nMyFinance\nMaersk App\nData Integrations\nCaptain Peter\nEmissions Studio\nAbout\nCareers\nAbout Us\nInvestors\nProcurement\nContainer Sales\nPress\nSustainability\nAccessibility\nMaersk Growth\n© A.P. Moller - Maersk\nFollow our journey. #AllTheWayToZero\n LinkedIn\n Facebook\n YouTube\n X\n Instagram\nTerms & conditions\nWhistleblower\nData Privacy Notification\nCookie policy\nCookie preferences\nBrand protection\nUnsolicited Submissions Policy\nTalk to an expert\nFind local offices & information\nSubscribe to our newsletter\nFeedback"
+}

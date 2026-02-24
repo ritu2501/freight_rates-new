@@ -1,0 +1,57 @@
+# Pricing Configuration
+# Global defaults and per-lane overrides
+
+global:
+  ttl_seconds: 86400          # 24 hours
+  deviation_pct: 30            # ±30% vs historical median
+  baseline_samples: 5          # min samples for deviation check
+  confidence_thresholds:
+    auto_accept: 0.8
+    flag_review: 0.5
+    reject: 0.0
+  rate_limits:
+    requests_per_account_per_30s: 1
+    max_retries: 3
+    backoff_base: 2
+  session:
+    pool_size: 3
+    idle_ttl_minutes: 30
+  circuit_breaker:
+    failure_threshold: 5
+    window_minutes: 10
+  scraper:
+    timeout_ms: 60000
+    headless: true
+  snapshot:
+    retention_hot_days: 90
+    retention_cold_days: 365
+    retention_archive_days: 1095
+
+container_types:
+  - "20FT"
+  - "40FT"
+  - "40HC"
+  - "45FT"
+  - "REEFER"
+  - "OOG"
+
+incoterms:
+  - "EXW"
+  - "FCA"
+  - "FAS"
+  - "FOB"
+  - "CFR"
+  - "CIF"
+  - "CPT"
+  - "CIP"
+  - "DAP"
+  - "DPU"
+  - "DDP"
+
+lane_overrides: {}
+  # Example:
+  # "SINGAPORE|CHENNAI|40FT|EXW":
+  #   ttl_seconds: 43200
+  #   deviation_pct: 20
+  #   min_transit_days: 5
+  #   max_transit_days: 15
