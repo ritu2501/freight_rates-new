@@ -10,10 +10,10 @@ async function main() {
 
   // ── Port aliases ──
   const ports = [
-    { alias: 'TUTICORIN (TAMIL NADU),', un_locode: 'INTUT', country: 'India' },
+    { alias: 'TUTICORIN', un_locode: 'INTUT', country: 'India' },
     { alias: 'CHENNAI', un_locode: 'INMAA', country: 'India' },
     { alias: 'NHAVA SHEVA', un_locode: 'INNSA', country: 'India' },
-    { alias: 'MUNDRA (GUJARAT),', un_locode: 'INMUN', country: 'India' },
+    { alias: 'MUNDRA', un_locode: 'INMUN', country: 'India' },
     { alias: 'KOLKATA', un_locode: 'INCCU', country: 'India' },
     { alias: 'COCHIN', un_locode: 'INCOK', country: 'India' },
     { alias: 'VISAKHAPATNAM', un_locode: 'INVTZ', country: 'India' },
@@ -88,6 +88,14 @@ async function main() {
       origin_local_haulage: 15.0, origin_thc: 120, customs: 60.0, origin_misc: 25.0,
       ocean_freight: 2200, destination_thc: 90, destination_haulage: 150, destination_misc: 45,
       total_price: 2705, currency: 'USD', transit_days: 35, service_type: 'Transshipment',
+      source: 'DB', confidence_score: 1.0, valid_until: '2026-03-31T23:59:59Z',
+    },
+    {
+      from_port: 'SINGAPORE', to_port: 'MUNDRA', destination_country: 'India',
+      container_type: '40FT', incoterm: 'EXW', month_label: 'Mar, 2026',
+      origin_local_haulage: 11.0, origin_thc: null, customs: 34.0, origin_misc: 32.0,
+      ocean_freight: 600, destination_thc: 40, destination_haulage: null, destination_misc: null,
+      total_price: 717, currency: 'USD', transit_days: 8, service_type: 'Direct',
       source: 'DB', confidence_score: 1.0, valid_until: '2026-03-31T23:59:59Z',
     },
   ];

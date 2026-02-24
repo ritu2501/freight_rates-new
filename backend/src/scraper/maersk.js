@@ -201,26 +201,39 @@ async function loginToMaersk(page, context) {
   // Stealth
   await hardenPage(page);
 
-  // Navigate to /book/
-  console.log('[Login] Navigating to /book/...');
-  await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(humanDelay(3000, 2000));
-  await dismissOverlays(page);
+  const username = process.env.MAERSK_USERNAME;
+  const password = process.env.MAERSK_PASSWORD;
+  if (!username || !password) {
+    console.warn('[Login] WARNING: MAERSK_USERNAME / MAERSK_PASSWORD not set in .env');
+    throw new Error('Not logged in and credentials missing. Please check .env.');
+  }
 
-  // Already logged in? (persistent context may have session cookies)
+  // ── STEP 1: Warm up cookies on main site (Akamai sensor builds trust) ──
+  console.log('[Login] Step 1: Warming up cookies on www.maersk.com...');
+  await page.goto('https://www.maersk.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(5000);
+  await dismissOverlays(page);
+  // Scroll a bit to trigger Akamai sensor
+  await page.evaluate(() => window.scrollTo(0, 300));
+  await page.waitForTimeout(2000);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(2000);
+  console.log('[Login] Cookies warmed. URL: ' + page.url());
+
+  // ── STEP 2: Navigate to /book/ — triggers login redirect ──
+  console.log('[Login] Step 2: Navigating to /book/...');
+  await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(humanDelay(4000, 2000));
+  await dismissOverlays(page);
+  await screenshot(page, 'login_01_after_book');
+
+  // Already logged in?
   if (await page.locator('#mc-input-origin').isVisible({ timeout: 5000 }).catch(() => false)) {
     console.log('[Login] Already logged in (session cookies from persistent profile)');
     return page;
   }
 
-  const username = process.env.MAERSK_USERNAME;
-  const password = process.env.MAERSK_PASSWORD;
-  if (!username || !password) {
-    console.warn('[Login] WARNING: MAERSK_USERNAME / MAERSK_PASSWORD not set in .env');
-    throw new Error('Not logged in and credentials missing. Please check .env or log in manually in the persistent profile.');
-  }
-
-  // Rate-limit guard - ONLY trigger if we actually need to log in
+  // Rate-limit guard
   if (fs.existsSync(LOCKOUT_FILE)) {
     const last = parseInt(fs.readFileSync(LOCKOUT_FILE, 'utf8'), 10);
     const elapsed = Date.now() - last;
@@ -232,201 +245,246 @@ async function loginToMaersk(page, context) {
   }
   fs.writeFileSync(LOCKOUT_FILE, String(Date.now()), 'utf8');
 
-  // Read-only 403 logger
+  // ── STEP 3: Wait for login form to render ──
+  console.log('[Login] Step 3: Waiting for login form...');
+  console.log('[Login] Current URL: ' + page.url());
+  console.log('[Login] Page title: ' + await page.title().catch(() => ''));
+
+  // Log 403s for debugging
   page.on('response', (resp) => {
     if (resp.status() === 403) {
-      console.log('[Login] 403 response: ' + resp.url().substring(0, 100));
+      console.log('[Login] 403: ' + resp.url().substring(0, 120));
     }
   });
 
-  // Fill credentials with human-like typing
-  console.log('[Login] Filling credentials...');
-  await page.waitForTimeout(humanDelay(1500, 1500));
-  await dismissOverlays(page);
+  // Wait longer for the form — Akamai may delay rendering
+  const userSelectors = [
+    '#mc-input-username',
+    'input[name="username"]',
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[placeholder*="email" i]',
+    'input[placeholder*="username" i]',
+    'input[id*="username" i]',
+    'input[id*="email" i]',
+    'input[autocomplete="username"]',
+  ];
 
-  const usernameInput = page.locator('#mc-input-username');
-  await usernameInput.waitFor({ state: 'visible', timeout: 15000 });
-  await usernameInput.click();
-  await page.waitForTimeout(humanDelay(400, 300));
+  let userField = null;
+  for (let waitAttempt = 0; waitAttempt < 6; waitAttempt++) {
+    for (const sel of userSelectors) {
+      const vis = await page.locator(sel).first().isVisible({ timeout: 2000 }).catch(() => false);
+      if (vis) {
+        userField = page.locator(sel).first();
+        console.log('[Login] Found username input: ' + sel);
+        break;
+      }
+    }
+    if (userField) break;
 
-  // Type character by character
-  for (const ch of username) {
-    await usernameInput.press(ch);
-    await page.waitForTimeout(humanDelay(60, 100));
+    console.log('[Login] Form not visible yet (attempt ' + (waitAttempt + 1) + '/6), waiting...');
+    await page.waitForTimeout(5000);
+    await dismissOverlays(page);
+
+    // If page text is empty, Akamai might be blocking — try reloading
+    if (waitAttempt === 2) {
+      const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+      if (!bodyText.trim()) {
+        console.log('[Login] Page is blank — reloading...');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await page.waitForTimeout(8000);
+        await dismissOverlays(page);
+      }
+    }
+
+    // On attempt 4, try navigating to /book/ again (fresh nonce)
+    if (waitAttempt === 4) {
+      console.log('[Login] Retrying /book/ navigation...');
+      await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(8000);
+      await dismissOverlays(page);
+    }
   }
-  await page.waitForTimeout(humanDelay(600, 400));
+
+  if (!userField) {
+    await screenshot(page, 'login_02_no_form');
+    const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+    console.log('[Login] Page text: ' + bodyText.substring(0, 500).replace(/\n/g, ' | '));
+    throw new Error('Login form not found after 30s. Check screenshots.');
+  }
+
+  // ── STEP 4: Fill credentials using clipboard paste (bypasses Akamai keystroke detection) ──
+  console.log('[Login] Step 4: Filling credentials via clipboard paste...');
+  await screenshot(page, 'login_03_form_found');
+
+  // Focus username field and paste
+  await userField.click();
+  await page.waitForTimeout(humanDelay(300, 200));
+
+  // Clear any existing value
+  await userField.fill('');
+  await page.waitForTimeout(300);
+
+  // Clipboard paste — undetectable by Akamai's keystroke analysis
+  await page.evaluate((val) => {
+    const input = document.querySelector('#mc-input-username') ||
+                  document.querySelector('input[name="username"]') ||
+                  document.querySelector('input[type="email"]') ||
+                  document.querySelector('input[autocomplete="username"]');
+    if (input) {
+      input.focus();
+      input.value = val;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, username);
+  await page.waitForTimeout(humanDelay(500, 300));
+
+  // Verify username was set
+  const typedUser = await userField.inputValue().catch(() => '');
+  console.log('[Login] Username field value: "' + typedUser.substring(0, 3) + '..."');
+
+  // If evaluate didn't work, fall back to pressSequentially
+  if (!typedUser) {
+    console.log('[Login] Clipboard paste failed — falling back to typing...');
+    await userField.click();
+    await userField.pressSequentially(username, { delay: humanDelay(60, 40) });
+    await page.waitForTimeout(300);
+  }
 
   // Tab to password
   await page.keyboard.press('Tab');
-  await page.waitForTimeout(humanDelay(300, 300));
+  await page.waitForTimeout(humanDelay(400, 300));
 
-  const passwordInput = page.locator('input[name="password"]:visible');
-  await passwordInput.waitFor({ state: 'visible', timeout: 5000 });
-
-  for (const ch of password) {
-    await passwordInput.press(ch);
-    await page.waitForTimeout(humanDelay(50, 90));
+  // Find and fill password
+  const pwdSelectors = [
+    'input[name="password"]:visible',
+    'input[type="password"]:visible',
+    'input[autocomplete="current-password"]:visible',
+  ];
+  let pwdField = null;
+  for (const sel of pwdSelectors) {
+    if (await page.locator(sel).first().isVisible({ timeout: 2000 }).catch(() => false)) {
+      pwdField = page.locator(sel).first();
+      break;
+    }
   }
-  await page.waitForTimeout(humanDelay(800, 500));
+
+  if (!pwdField) {
+    throw new Error('Password field not found');
+  }
+
+  await pwdField.click();
+  await page.waitForTimeout(300);
+
+  // Clipboard paste for password
+  await page.evaluate((val) => {
+    const input = document.querySelector('input[name="password"]') ||
+                  document.querySelector('input[type="password"]');
+    if (input) {
+      input.focus();
+      input.value = val;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, password);
+  await page.waitForTimeout(humanDelay(500, 300));
+
+  // Verify password was set
+  const typedPwd = await pwdField.inputValue().catch(() => '');
+  if (!typedPwd) {
+    console.log('[Login] Password paste failed — falling back to typing...');
+    await pwdField.click();
+    await pwdField.pressSequentially(password, { delay: humanDelay(50, 40) });
+    await page.waitForTimeout(300);
+  }
+
+  console.log('[Login] Credentials filled.');
+  await screenshot(page, 'login_04_creds_filled');
   await dismissOverlays(page);
 
-  // Submit
-  console.log('[Login] Submitting...');
-  await page.locator('button[type="submit"]').click();
+  // ── STEP 5: Submit ──
+  console.log('[Login] Step 5: Submitting...');
+  await page.waitForTimeout(humanDelay(600, 400));
 
-  // Wait for OIDC chain
+  const submitSelectors = [
+    'button[type="submit"]',
+    'mc-button[type="submit"]',
+    'button:has-text("Log in")',
+    'button:has-text("Sign in")',
+    'input[type="submit"]',
+  ];
+  let submitted = false;
+  for (const sel of submitSelectors) {
+    const btn = page.locator(sel).first();
+    if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await btn.click();
+      submitted = true;
+      console.log('[Login] Clicked submit: ' + sel);
+      break;
+    }
+  }
+  if (!submitted) {
+    // Fallback: press Enter
+    console.log('[Login] No submit button found — pressing Enter...');
+    await page.keyboard.press('Enter');
+  }
+
+  // ── STEP 6: Wait for login to complete (OIDC redirect chain) ──
+  console.log('[Login] Step 6: Waiting for OIDC redirect...');
   const loginDeadline = Date.now() + 90000;
   let loggedIn = false;
-  let isRecoveryPage = false;
-  let retryLoginDone = false;
 
-  try { await page.waitForTimeout(12000); } catch { /* page may close */ }
+  await page.waitForTimeout(10000); // Initial wait for redirect chain
 
   while (Date.now() < loginDeadline) {
-    try { await page.waitForTimeout(3000); } catch { /* page closed */ }
+    await page.waitForTimeout(3000).catch(() => {});
 
     if (!isPageAlive(page)) {
-      console.log('[Login] Page closed - opening new page...');
-      if (!isContextAlive(context)) {
-        console.log('[Login] Browser context is dead - cannot recover');
-        throw new Error('Browser context destroyed during login');
-      }
-      try {
-        page = await context.newPage();
-        await hardenPage(page);
-        isRecoveryPage = true;
-        page.on('response', (resp) => {
-          if (resp.status() === 403) {
-            console.log('[Login] 403 on recovery: ' + resp.url().substring(0, 100));
-          }
-        });
-        await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(humanDelay(4000, 2000));
-        await dismissOverlays(page);
-      } catch (e) {
-        console.log('[Login] New page error: ' + e.message.substring(0, 80));
-        if (e.message.includes('has been closed') || e.message.includes('destroyed')) {
-          throw new Error('Browser context destroyed during login');
-        }
-        continue;
-      }
+      console.log('[Login] Page closed — recovering...');
+      if (!isContextAlive(context)) throw new Error('Browser context destroyed');
+      page = await context.newPage();
+      await hardenPage(page);
+      await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(5000);
+      await dismissOverlays(page);
     }
 
-    // Booking form visible = logged in
-    try {
-      if (await page.locator('#mc-input-origin').isVisible({ timeout: 2000 }).catch(() => false)) {
-        loggedIn = true;
-        break;
-      }
-    } catch { continue; }
+    // Check for booking form
+    if (await page.locator('#mc-input-origin').isVisible({ timeout: 3000 }).catch(() => false)) {
+      loggedIn = true;
+      break;
+    }
 
-    let currentUrl = '';
-    try { currentUrl = page.url(); } catch { continue; }
+    const url = page.url();
     const remaining = Math.ceil((loginDeadline - Date.now()) / 1000);
-    console.log('[Login] ' + remaining + 's left | ' + currentUrl.substring(0, 80));
+    console.log('[Login] ' + remaining + 's left | ' + url.substring(0, 100));
 
-    // Recovery: re-fill on NEW page only
-    if (isRecoveryPage && !retryLoginDone &&
-      currentUrl.includes('accounts.maersk.com') && currentUrl.includes('/auth/login')) {
-      const uInput = page.locator('#mc-input-username');
-      const uVisible = await uInput.isVisible({ timeout: 2000 }).catch(() => false);
-      if (uVisible) {
-        console.log('[Login] Recovery: re-filling credentials...');
-        retryLoginDone = true;
-        try {
-          await dismissOverlays(page);
-          await uInput.click();
-          await page.waitForTimeout(humanDelay(400, 300));
-          for (const ch of username) {
-            await uInput.press(ch);
-            await page.waitForTimeout(humanDelay(60, 100));
-          }
-          await page.waitForTimeout(humanDelay(500, 400));
-          await page.keyboard.press('Tab');
-          await page.waitForTimeout(humanDelay(300, 200));
-          const pInput = page.locator('input[name="password"]:visible');
-          for (const ch of password) {
-            await pInput.press(ch);
-            await page.waitForTimeout(humanDelay(50, 90));
-          }
-          await page.waitForTimeout(humanDelay(800, 400));
-          console.log('[Login] Recovery: submitting...');
-          await page.locator('button[type="submit"]').click();
-          await page.waitForTimeout(12000);
-        } catch (e) {
-          console.log('[Login] Recovery error: ' + e.message.substring(0, 80));
-        }
-        continue;
+    // Handle "why upgrade" interstitial
+    if (url.includes('why-upgrade')) {
+      const laterBtn = page.locator('text=Complete later').first();
+      if (await laterBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await laterBtn.click();
+        await page.waitForTimeout(3000);
       }
     }
 
-    // Landed on www.maersk.com but not /book/
-    if (currentUrl.startsWith('https://www.maersk.com') && !currentUrl.includes('/book')) {
-      try {
-        if (currentUrl.includes('why-upgrade')) {
-          const laterBtn = page.locator('text=Complete later').first();
-          if (await laterBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log('[Login] Clicking "Complete later"...');
-            await laterBtn.click();
-            await page.waitForTimeout(3000);
-          }
-        }
-        if (!page.url().includes('/book')) {
-          console.log('[Login] Navigating to /book/...');
-          await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          await page.waitForTimeout(humanDelay(3000, 2000));
-          await dismissOverlays(page);
-        }
-      } catch (e) {
-        console.log('[Login] Nav error: ' + e.message.substring(0, 80));
-      }
+    // If on maersk.com but not /book/, navigate there
+    if (url.startsWith('https://www.maersk.com') && !url.includes('/book') && !url.includes('accounts.maersk.com')) {
+      await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(5000);
+      await dismissOverlays(page);
     }
   }
 
   if (loggedIn) {
-    console.log('[Login] SUCCESS - booking form ready');
+    console.log('[Login] SUCCESS — booking form ready');
+    await screenshot(page, 'login_05_success');
     return page;
   }
 
-  // Last resort: wait for human
-  console.log('[Login] Auto-login incomplete. URL: ' + (isPageAlive(page) ? page.url() : 'page closed'));
-  await screenshot(page, 'login_incomplete').catch(() => { });
-
-  console.log('\n=== WAITING for login in browser window (2 min) ===\n');
-
-  const humanDeadline2 = Date.now() + 120000;
-  while (Date.now() < humanDeadline2) {
-    try { await page.waitForTimeout(5000); } catch { }
-
-    if (!isPageAlive(page)) {
-      if (!isContextAlive(context)) {
-        console.log('[Login] Browser context is dead in manual wait');
-        throw new Error('Browser context destroyed - cannot recover');
-      }
-      try {
-        page = await context.newPage();
-        await hardenPage(page);
-        await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(3000);
-      } catch (e) {
-        if (e.message.includes('has been closed') || e.message.includes('destroyed')) {
-          throw new Error('Browser context destroyed - cannot recover');
-        }
-        continue;
-      }
-    }
-
-    try {
-      if (await page.locator('#mc-input-origin').isVisible({ timeout: 2000 }).catch(() => false)) {
-        console.log('[Login] Booking form detected!');
-        return page;
-      }
-    } catch { }
-
-    console.log('[Login] Waiting... ' + Math.ceil((humanDeadline2 - Date.now()) / 1000) + 's remaining');
-  }
-
-  throw new Error('Login failed - booking form not visible after all retries');
+  await screenshot(page, 'login_05_failed');
+  throw new Error('Login timed out. URL: ' + (isPageAlive(page) ? page.url() : 'page closed'));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -567,23 +625,17 @@ async function scrapeMaerskSpotRate(params) {
     // This is critical: Akamai _abck sensor cookie persists, avoiding 403
     console.log('[Scraper] Using persistent profile: ' + PROFILE_DIR);
     context = await chromium.launchPersistentContext(PROFILE_DIR, {
-      headless: true,
+      headless: false,
       channel: 'msedge',
-      slowMo: 50,  // Reduced slowMo since it's headless now
+      slowMo: 60,
       viewport: { width: 1920, height: 1080 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
       locale: 'en-US',
       timezoneId: 'Asia/Kolkata',
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
         '--start-maximized',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-infobars',
         '--no-first-run',
         '--no-default-browser-check',
-        '--disable-component-update',
-        '--disable-features=RendererCodeIntegrity',
       ],
     });
 
@@ -1274,19 +1326,48 @@ function simulateScrape(params) {
     'SHANGHAI-TUTICORIN': { price: 820, transit: 15 }, 'SINGAPORE-ISTANBUL': { price: 1350, transit: 22 },
     'SHANGHAI-MERSIN': { price: 1380, transit: 24 }, 'SINGAPORE-LAGOS': { price: 1680, transit: 28 },
     'SHANGHAI-LAGOS': { price: 1920, transit: 32 }, 'SHANGHAI-JEBEL ALI': { price: 720, transit: 12 },
+    'SINGAPORE-MUNDRA': { price: 580, transit: 8 }, 'SHANGHAI-MUNDRA': { price: 750, transit: 14 },
   };
   const key = params.from_port.toUpperCase() + '-' + params.to_port.toUpperCase();
   const base = basePrices[key] || { price: 500 + Math.floor(Math.random() * 2000), transit: 7 + Math.floor(Math.random() * 30) };
-  const price = Math.round(base.price * (0.9 + Math.random() * 0.2));
-  const originThc = Math.round(80 + Math.random() * 60);
-  const destThc = Math.round(40 + Math.random() * 50);
-  const candidates = [{
-    price, currency: 'USD', transit_days: base.transit, service_type: 'Maersk Spot - Direct',
-    valid_until: validUntil(), confidence_score: Math.round((0.85 + Math.random() * 0.15) * 100) / 100,
-    extraction_method: 'SIMULATED', snapshot_id: 'snap_sim_' + uuidv4().slice(0, 8),
-    ocean_freight: price, origin_thc: originThc,
-    destination_thc: destThc, total_price: price + originThc + destThc,
-  }];
+
+  // Generate multiple candidates (3-6) like real Maersk results page
+  const serviceOptions = [
+    { suffix: 'Maersk Spot', transitDelta: 0, priceFactor: 1.0 },
+    { suffix: 'Maersk Spot - Earliest', transitDelta: -1, priceFactor: 1.12 },
+    { suffix: 'Maersk Spot - Direct', transitDelta: 0, priceFactor: 1.05 },
+    { suffix: 'Maersk Spot - Cheapest', transitDelta: 3, priceFactor: 0.88 },
+    { suffix: 'Maersk Spot - Transhipment', transitDelta: 5, priceFactor: 0.82 },
+    { suffix: 'Maersk Spot - Economy', transitDelta: 7, priceFactor: 0.75 },
+  ];
+
+  const numCandidates = 3 + Math.floor(Math.random() * 4); // 3 to 6
+  const shuffled = serviceOptions.sort(() => Math.random() - 0.5).slice(0, numCandidates);
+  const baseDate = params.ship_date ? new Date(params.ship_date) : new Date();
+
+  const candidates = shuffled.map((opt, idx) => {
+    const price = Math.round(base.price * opt.priceFactor * (0.95 + Math.random() * 0.1));
+    const transitDays = Math.max(1, base.transit + opt.transitDelta + Math.floor(Math.random() * 2));
+    const originThc = Math.round(80 + Math.random() * 60);
+    const destThc = Math.round(40 + Math.random() * 50);
+    const depDate = new Date(baseDate);
+    depDate.setDate(depDate.getDate() + idx * 2 + Math.floor(Math.random() * 3));
+    return {
+      price, currency: 'USD', transit_days: transitDays,
+      service_type: opt.suffix,
+      departure_date: depDate.toISOString().split('T')[0],
+      valid_until: validUntil(),
+      confidence_score: Math.round((0.80 + Math.random() * 0.20) * 100) / 100,
+      extraction_method: 'SIMULATED',
+      snapshot_id: 'snap_sim_' + uuidv4().slice(0, 8),
+      ocean_freight: price, origin_thc: originThc,
+      destination_thc: destThc, total_price: price + originThc + destThc,
+    };
+  });
+
+  // Sort by total_price ascending (cheapest first)
+  candidates.sort((a, b) => a.total_price - b.total_price);
+
   return {
     job_id: jobId, status: 'SUCCESS', snapshot_id: candidates[0].snapshot_id,
     elapsed_ms: 1200 + Math.floor(Math.random() * 3000), candidates, simulated: true,

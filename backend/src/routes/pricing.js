@@ -116,30 +116,31 @@ router.post('/check', (req, res) => {
 
   const ct = container_type || '40FT';
 
-  // Check pricing table
-  const row = db.prepare(`
+  // Fetch ALL matching prices (not just one)
+  const rows = db.prepare(`
     SELECT * FROM pricing
     WHERE from_port = ? COLLATE NOCASE
       AND to_port = ? COLLATE NOCASE
       AND container_type = ? COLLATE NOCASE
     ORDER BY created_at DESC
-    LIMIT 1
-  `).get(from_port, to_port, ct);
+  `).all(from_port, to_port, ct);
 
-  if (row) {
-    // Check TTL
+  // Filter by TTL — keep only non-expired rows
+  const validRows = rows.filter((row) => {
     const age = (Date.now() - new Date(row.created_at).getTime()) / 1000;
     const ttl = row.ttl_seconds || 86400;
+    return age <= ttl;
+  });
 
-    if (age <= ttl) {
-      return res.json({
-        status: 'SUCCESS',
-        source: row.source,
-        found: true,
-        data: row,
-        message: 'Price found in internal database.',
-      });
-    }
+  if (validRows.length > 0) {
+    return res.json({
+      status: 'SUCCESS',
+      source: validRows[0].source,
+      found: true,
+      data: validRows,          // array of ALL matching prices
+      count: validRows.length,
+      message: `${validRows.length} price(s) found in internal database.`,
+    });
   }
 
   // No valid price found
@@ -147,6 +148,8 @@ router.post('/check', (req, res) => {
     status: 'NOT_FOUND',
     source: null,
     found: false,
+    data: [],
+    count: 0,
     message: 'No valid internal price found. You can request a Maersk spot rate.',
     from_port,
     to_port,
