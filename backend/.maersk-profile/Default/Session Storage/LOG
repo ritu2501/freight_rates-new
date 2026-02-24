@@ -1,6 +1,0 @@
-2026/02/24-15:28:22.752 2114 Reusing MANIFEST C:\Users\ritvi\OneDrive\Desktop\jina-code\freight_rates-new\backend\.maersk-profile\Default\Session Storage/MANIFEST-000001
-2026/02/24-15:28:22.756 2114 Recovering log #49
-2026/02/24-15:28:22.762 2114 Reusing old log C:\Users\ritvi\OneDrive\Desktop\jina-code\freight_rates-new\backend\.maersk-profile\Default\Session Storage/000049.log 
-2026/02/24-15:28:34.391 65cc Level-0 table #51: started
-2026/02/24-15:28:34.403 65cc Level-0 table #51: 32323 bytes OK
-2026/02/24-15:28:34.408 65cc Delete type=0 #49
