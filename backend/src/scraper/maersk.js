@@ -60,18 +60,25 @@ async function screenshot(page, label) {
 
 async function dismissOverlays(page) {
   try {
-    const btn = page.locator('.coi-banner__accept').first();
+    // 1. Accept button in the cookie banner
+    const btn = page.locator('.coi-banner__accept, .coi-banner__accept--all, mc-button:has-text("Allow all"), mc-button:has-text("Accept all")').first();
     if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await btn.click({ force: true });
+      await btn.click({ force: true }).catch(() => { });
       await page.waitForTimeout(800);
     }
+
+    // 2. Clear known overlay IDs from DOM
     await page.evaluate(() => {
-      document.getElementById('coiOverlay')?.remove();
-      document.getElementById('cookie-information-template-wrapper')?.remove();
+      const ids = ['coiOverlay', 'cookie-information-template-wrapper', 'coi-banner-wrapper'];
+      ids.forEach(id => document.getElementById(id)?.remove());
+      // Also clear any elements with coi-banner class
+      document.querySelectorAll('.coi-banner, .coi-banner-wrapper').forEach(el => el.remove());
     }).catch(() => { });
-    const coach = page.locator('button.coach__button--finish');
+
+    // 3. Finish coach/walkthrough
+    const coach = page.locator('button.coach__button--finish, mc-button:has-text("Finish")').first();
     if (await coach.isVisible({ timeout: 800 }).catch(() => false)) {
-      await coach.click();
+      await coach.click().catch(() => { });
       await page.waitForTimeout(500);
     }
   } catch { /* ignore */ }
@@ -191,10 +198,6 @@ async function hardenPage(page) {
 // ══════════════════════════════════════════════════════════════════════════
 
 async function loginToMaersk(page, context) {
-  const username = process.env.MAERSK_USERNAME;
-  const password = process.env.MAERSK_PASSWORD;
-  if (!username || !password) throw new Error('MAERSK_USERNAME / MAERSK_PASSWORD not set in .env');
-
   // Stealth
   await hardenPage(page);
 
@@ -208,6 +211,13 @@ async function loginToMaersk(page, context) {
   if (await page.locator('#mc-input-origin').isVisible({ timeout: 5000 }).catch(() => false)) {
     console.log('[Login] Already logged in (session cookies from persistent profile)');
     return page;
+  }
+
+  const username = process.env.MAERSK_USERNAME;
+  const password = process.env.MAERSK_PASSWORD;
+  if (!username || !password) {
+    console.warn('[Login] WARNING: MAERSK_USERNAME / MAERSK_PASSWORD not set in .env');
+    throw new Error('Not logged in and credentials missing. Please check .env or log in manually in the persistent profile.');
   }
 
   // Rate-limit guard - ONLY trigger if we actually need to log in
@@ -495,12 +505,24 @@ async function fillCombobox(page, selector, text, label) {
       'ul[role="listbox"] li', 'mds-listbox-option', 'mc-option',
     ];
     for (const sel of dropdownSelectors) {
-      const opt = page.locator(sel).first();
-      if (await opt.isVisible({ timeout: 2000 }).catch(() => false)) {
-        const t = await opt.textContent().catch(() => '');
+      const opts = page.locator(sel).filter({ visible: true });
+      const count = await opts.count().catch(() => 0);
+      if (count > 0) {
+        // Try to find an option that looks like it matches, otherwise take first visible
+        let bestOpt = opts.first();
+        for (let i = 0; i < Math.min(count, 5); i++) {
+          const optText = await opts.nth(i).textContent().catch(() => '');
+          if (optText.toLowerCase().includes(text.toLowerCase())) {
+            bestOpt = opts.nth(i);
+            break;
+          }
+        }
+        const t = await bestOpt.textContent().catch(() => '');
         console.log('[Form] ' + label + ' selected: "' + t.trim() + '" (attempt ' + (attempt + 1) + ', ' + strategy.name + ')');
-        await opt.click();
-        await page.waitForTimeout(600);
+        await bestOpt.click().catch(async () => {
+          await bestOpt.click({ force: true });
+        });
+        await page.waitForTimeout(800);
         return true;
       }
     }
@@ -795,19 +817,27 @@ async function scrapeMaerskSpotRate(params) {
         // Origin = first pair, Destination = second pair
         if (cyRadios.length >= 1 && sdRadios.length >= 1) {
           if (originInland === 'SD' && sdRadios.length >= 1) {
-            await allRadios.nth(sdRadios[0]).click({ force: true });
+            const r = allRadios.nth(sdRadios[0]);
+            await r.scrollIntoViewIfNeeded().catch(() => { });
+            await r.click({ force: true });
             console.log('[Form] Origin SD selected (generic radio)');
           } else if (originInland === 'CY' && cyRadios.length >= 1) {
-            await allRadios.nth(cyRadios[0]).click({ force: true });
+            const r = allRadios.nth(cyRadios[0]);
+            await r.scrollIntoViewIfNeeded().catch(() => { });
+            await r.click({ force: true });
             console.log('[Form] Origin CY selected (generic radio)');
           }
         }
         if (cyRadios.length >= 2 && sdRadios.length >= 2) {
           if (destInland === 'SD') {
-            await allRadios.nth(sdRadios[1]).click({ force: true });
+            const r = allRadios.nth(sdRadios[1]);
+            await r.scrollIntoViewIfNeeded().catch(() => { });
+            await r.click({ force: true });
             console.log('[Form] Destination SD selected (generic radio)');
           } else {
-            await allRadios.nth(cyRadios[1]).click({ force: true });
+            const r = allRadios.nth(cyRadios[1]);
+            await r.scrollIntoViewIfNeeded().catch(() => { });
+            await r.click({ force: true });
             console.log('[Form] Destination CY selected (generic radio)');
           }
         }
@@ -836,11 +866,13 @@ async function scrapeMaerskSpotRate(params) {
       const commodity = params.commodity || 'General';
       console.log('[Form] Commodity: "' + commodity + '"');
       await comIn.click(); await page.waitForTimeout(300);
-      await comIn.pressSequentially(commodity, { delay: 80 });
-      await page.waitForTimeout(2500);
-      const cOpt = page.locator('li[role="option"]').first();
-      if (await cOpt.isVisible({ timeout: 3000 }).catch(() => false)) await cOpt.click();
-      else { await comIn.press('ArrowDown'); await page.waitForTimeout(300); await comIn.press('Enter'); }
+      await comIn.pressSequentially(commodity, { delay: 100 });
+      await page.waitForTimeout(3000);
+      const cOpts = page.locator('li[role="option"], mc-option, [role="option"]').filter({ visible: true });
+      if (await cOpts.count().catch(() => 0) > 0) {
+        await cOpts.first().click().catch(() => cOpts.first().click({ force: true }));
+      }
+      else { await comIn.press('ArrowDown'); await page.waitForTimeout(500); await comIn.press('Enter'); }
       await page.waitForTimeout(1500);
     }
 
@@ -868,11 +900,13 @@ async function scrapeMaerskSpotRate(params) {
       const ct = mapContainer(params.container_type);
       console.log('[Form] Container: ' + ct);
       await contIn.click(); await page.waitForTimeout(500);
-      await contIn.pressSequentially(ct, { delay: 80 });
-      await page.waitForTimeout(1500);
-      const cOpt = page.locator('li[role="option"]').first();
-      if (await cOpt.isVisible({ timeout: 3000 }).catch(() => false)) await cOpt.click();
-      else { await contIn.press('ArrowDown'); await page.waitForTimeout(300); await contIn.press('Enter'); }
+      await contIn.pressSequentially(ct, { delay: 100 });
+      await page.waitForTimeout(2000);
+      const ctOpts = page.locator('li[role="option"], mc-option, [role="option"]').filter({ visible: true });
+      if (await ctOpts.count().catch(() => 0) > 0) {
+        await ctOpts.first().click().catch(() => ctOpts.first().click({ force: true }));
+      }
+      else { await contIn.press('ArrowDown'); await page.waitForTimeout(500); await contIn.press('Enter'); }
       await page.waitForTimeout(1000);
     }
 
