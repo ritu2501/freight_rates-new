@@ -6,7 +6,7 @@ const { scrapeMaerskSpotRate } = require('./src/scraper/maersk');
     try {
         const result = await scrapeMaerskSpotRate({
             from_port: 'Singapore',
-            to_port: 'Mundra',
+            to_port: 'MUNDRA (GUJARAT)',
             container_type: '40HIGH',
             number_of_containers: 1,
             weight_per_container: 2500,

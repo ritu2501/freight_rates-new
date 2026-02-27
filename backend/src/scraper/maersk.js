@@ -1,1296 +1,923 @@
 /**
  * Maersk Spot Rate Scraper
- *
- * Uses launchPersistentContext with .maersk-profile to preserve cookies
- * (including Akamai _abck sensor cookie) between sessions. This is critical
- * because Akamai validates the sensor cookie on every /authenticate request.
- *
- * NO route interception (page.route) — that proxies requests through Node.js
- * TLS stack and causes Akamai 403. All browser requests are native.
+ * 
+ * Uses Playwright with a persistent Edge profile to scrape pricing data
+ * from Maersk's booking portal.
+ * 
+ * Functions:
+ *  - simulateScrape(params)       → Returns mock data for testing
+ *  - scrapeMaerskSpotRate(params) → Live scraper using Playwright
  */
+require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') });
 
-const { v4: uuidv4 } = require('uuid');
+const { chromium } = require('playwright');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
-// ── Constants ─────────────────────────────────────────────────────────────
-const SNAPSHOT_DIR = process.env.SNAPSHOT_DIR || path.join(__dirname, '..', '..', 'snapshots');
-const MAERSK_BOOK_URL = 'https://www.maersk.com/book/';
+// Configuration
 const PROFILE_DIR = path.join(__dirname, '..', '..', '.maersk-profile');
-const LOCKOUT_FILE = path.join(__dirname, '..', '..', '.last-login-attempt');
-const MIN_LOGIN_INTERVAL_MS = 2 * 60 * 1000;
+const SNAPSHOT_DIR = path.join(__dirname, '..', '..', 'snapshots');
+const BOOK_URL = 'https://www.maersk.com/book/';
+const ENCRYPTION_KEY = process.env.SNAPSHOT_KEY || 'change-me-in-production-32chars!';
+const DEFAULT_TIMEOUT = parseInt(process.env.SCRAPER_TIMEOUT_MS, 10) || 60000;
 
-if (!fs.existsSync(SNAPSHOT_DIR)) fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+// Maersk Login Credentials (from .env or defaults)
+const MAERSK_USERNAME = process.env.MAERSK_USERNAME || 'Eximsingpore';
+const MAERSK_PASSWORD = process.env.MAERSK_PASSWORD || 'Qwerty@12345';
+
+// Ensure directories exist
 if (!fs.existsSync(PROFILE_DIR)) fs.mkdirSync(PROFILE_DIR, { recursive: true });
+if (!fs.existsSync(SNAPSHOT_DIR)) fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
 
-// ══════════════════════════════════════════════════════════════════════════
-// UTILITIES
-// ══════════════════════════════════════════════════════════════════════════
+/**
+ * Container type mapping (our format → Maersk format)
+ */
+const CONTAINER_MAP = {
+  '20FT': '20\' Dry',
+  '40FT': '40\' Dry',
+  '40HC': '40\' High Cube Dry',
+  '40HIGH': '40\' High Cube Dry', // Add common alias
+  '45FT': '45\' High Cube Dry',
+  'REEFER': '40\' Reefer High Cube',
+  'OOG': '40\' Open Top',
+};
 
-function encryptSnapshot(html) {
-  const key = (process.env.ENCRYPTION_KEY || 'change-me-in-production-32chars!').padEnd(32, '0').slice(0, 32);
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(key), iv);
-  let enc = cipher.update(html, 'utf8', 'hex');
-  enc += cipher.final('hex');
-  return { iv: iv.toString('hex'), data: enc };
+/**
+ * Simulate a scrape — returns mock data for development/testing
+ */
+function simulateScrape(params) {
+  const {
+    from_port, to_port, container_type = '40FT',
+    ship_date, job_id,
+  } = params;
+
+  console.log(`[Scraper SIM] Job ${job_id} | ${from_port} → ${to_port} | ${container_type}`);
+
+  // Simulate some delay
+  const basePrice = 1500 + Math.floor(Math.random() * 2000);
+  const transitDays = 10 + Math.floor(Math.random() * 25);
+  const validUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const candidate = {
+    price: basePrice,
+    total_price: basePrice,
+    ocean_freight: Math.round(basePrice * 0.75),
+    origin_thc: Math.round(basePrice * 0.1),
+    destination_thc: Math.round(basePrice * 0.1),
+    origin_misc: Math.round(basePrice * 0.05),
+    currency: 'USD',
+    transit_days: transitDays,
+    service_type: 'STANDARD',
+    carrier: 'Maersk',
+    valid_until: validUntil,
+    confidence_score: 0.85,
+    snapshot_id: null,
+  };
+
+  return {
+    status: 'SUCCESS',
+    source: 'SIMULATION',
+    candidates: [candidate],
+    snapshot_id: null,
+  };
 }
 
+/**
+ * Save encrypted HTML snapshot for compliance/debugging
+ */
 function saveSnapshot(html, jobId) {
-  const id = `snap_${uuidv4()}`;
-  const encrypted = encryptSnapshot(html);
-  const checksum = crypto.createHash('sha256').update(html).digest('hex');
-  const meta = {
-    snapshot_id: id, job_id: jobId, checksum, iv: encrypted.iv,
-    created_at: new Date().toISOString(), size_bytes: Buffer.byteLength(html, 'utf8'),
-  };
-  fs.writeFileSync(path.join(SNAPSHOT_DIR, `${id}.enc`), encrypted.data, 'utf8');
-  fs.writeFileSync(path.join(SNAPSHOT_DIR, `${id}.meta.json`), JSON.stringify(meta, null, 2), 'utf8');
-  return id;
+  const snapshotId = `snap_${uuidv4()}`;
+  const iv = crypto.randomBytes(16);
+  const key = Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32));
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  
+  let encrypted = cipher.update(html, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+
+  const encPath = path.join(SNAPSHOT_DIR, `${snapshotId}.enc`);
+  const metaPath = path.join(SNAPSHOT_DIR, `${snapshotId}.meta.json`);
+
+  fs.writeFileSync(encPath, encrypted);
+  fs.writeFileSync(metaPath, JSON.stringify({
+    snapshot_id: snapshotId,
+    job_id: jobId,
+    checksum: crypto.createHash('sha256').update(html).digest('hex'),
+    iv: iv.toString('hex'),
+    created_at: new Date().toISOString(),
+    size_bytes: html.length,
+  }, null, 2));
+
+  console.log(`[Scraper] Snapshot saved: ${snapshotId}`);
+  return snapshotId;
 }
 
-async function screenshot(page, label) {
-  try {
-    const dest = path.join(SNAPSHOT_DIR, `debug_${label}_${Date.now()}.png`);
-    await page.screenshot({ path: dest, fullPage: false });
-    console.log(`  [screenshot] ${dest}`);
-  } catch (e) { /* page might be closed */ }
-}
-
-async function dismissOverlays(page) {
-  try {
-    // 1. Accept button in the cookie banner
-    const btn = page.locator('.coi-banner__accept, .coi-banner__accept--all, mc-button:has-text("Allow all"), mc-button:has-text("Accept all")').first();
-    if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await btn.click({ force: true }).catch(() => { });
-      await page.waitForTimeout(800);
-    }
-
-    // 2. Clear known overlay IDs from DOM
-    await page.evaluate(() => {
-      const ids = ['coiOverlay', 'cookie-information-template-wrapper', 'coi-banner-wrapper'];
-      ids.forEach(id => document.getElementById(id)?.remove());
-      // Also clear any elements with coi-banner class
-      document.querySelectorAll('.coi-banner, .coi-banner-wrapper').forEach(el => el.remove());
-    }).catch(() => { });
-
-    // 3. Finish coach/walkthrough
-    const coach = page.locator('button.coach__button--finish, mc-button:has-text("Finish")').first();
-    if (await coach.isVisible({ timeout: 800 }).catch(() => false)) {
-      await coach.click().catch(() => { });
-      await page.waitForTimeout(500);
-    }
-  } catch { /* ignore */ }
-}
-
-async function safeInputValue(loc) {
-  try { return (await loc.inputValue()) || ''; } catch { return ''; }
-}
-
-function mapContainer(type) {
-  const m = {
-    '20DRY': '20 Dry Standard', '40DRY': '40 Dry Standard', '40HIGH': '40 Dry High', '45HIGH': '45 Dry High',
-    '20FT': '20 Dry Standard', '40FT': '40 Dry Standard', '40HC': '40 Dry High', '45FT': '45 Dry High',
-  };
-  return m[type?.toUpperCase()] || '40 Dry High';
-}
-
-function fmtDate(dateStr) {
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) { const t = new Date(); t.setDate(t.getDate() + 1); return fmtDate(t.toISOString().split('T')[0]); }
-  const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return `${String(d.getDate()).padStart(2, '0')} ${M[d.getMonth()]} ${d.getFullYear()}`;
-}
-
-function confidence(r) {
-  let s = 0;
-  if (r.price > 0) s += 0.35;
-  if (['USD', 'EUR', 'GBP'].includes(r.currency)) s += 0.2;
-  if (r.transit_days > 0 && r.transit_days < 90) s += 0.2;
-  if (r.valid_until) s += 0.15;
-  s += 0.1;
-  return Math.round(s * 100) / 100;
-}
-
-function validUntil() { const d = new Date(); d.setDate(d.getDate() + 7); return d.toISOString(); }
-
-function isPageAlive(page) {
-  try { return !page.isClosed(); } catch { return false; }
-}
-
-function isContextAlive(ctx) {
-  try { ctx.pages(); return true; } catch { return false; }
-}
-
-function humanDelay(baseMs, jitterMs) {
-  return baseMs + Math.floor(Math.random() * jitterMs);
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// BROWSER STEALTH
-// ══════════════════════════════════════════════════════════════════════════
-
-async function hardenPage(page) {
-  await page.addInitScript(() => {
-    // Block window.close()
-    window.close = function () { };
-
-    // Remove webdriver flag
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
-
-    // Chrome runtime
-    if (!window.chrome) window.chrome = {};
-    if (!window.chrome.runtime) {
-      window.chrome.runtime = { connect: function () { }, sendMessage: function () { } };
-    }
-
-    // Plugins
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => {
-        const arr = [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-        ];
-        arr.item = (i) => arr[i] || null;
-        arr.namedItem = (n) => arr.find(p => p.name === n) || null;
-        arr.refresh = () => { };
-        return arr;
-      },
-    });
-
-    // Misc fingerprint
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-
-    // Permissions
-    const origPQ = window.navigator.permissions?.query;
-    if (origPQ) {
-      window.navigator.permissions.query = (params) =>
-        params.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : origPQ.call(window.navigator.permissions, params);
-    }
-
-    // WebGL
-    const getParam = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function (p) {
-      if (p === 37445) return 'Intel Inc.';
-      if (p === 37446) return 'Intel Iris OpenGL Engine';
-      return getParam.call(this, p);
-    };
-
-    // Hide overrides
-    const origTS = Function.prototype.toString;
-    const patched = new Set([window.close]);
-    Function.prototype.toString = function () {
-      if (patched.has(this)) return 'function close() { [native code] }';
-      return origTS.call(this);
-    };
-  });
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// LOGIN
-// ══════════════════════════════════════════════════════════════════════════
-
-async function loginToMaersk(page, context) {
-  // Stealth
-  await hardenPage(page);
-
-  // Navigate to /book/
-  console.log('[Login] Navigating to /book/...');
-  await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(humanDelay(3000, 2000));
-  await dismissOverlays(page);
-
-  // Already logged in? (persistent context may have session cookies)
-  if (await page.locator('#mc-input-origin').isVisible({ timeout: 5000 }).catch(() => false)) {
-    console.log('[Login] Already logged in (session cookies from persistent profile)');
-    return page;
+/**
+ * Fill a Maersk web component input field with proper event dispatching
+ * This handles the mc-typeahead/mc-text-field components that use Shadow DOM
+ */
+async function fillMaerskInput(page, inputSelector, value, fieldName) {
+  // Sanitize value for typing - strip parentheses if likely a port name
+  const sanitizedValue = value.includes('(') ? value.split('(')[0].trim() : value;
+  console.log(`[Scraper] Filling ${fieldName}: "${sanitizedValue}" (original: "${value}")`);
+  
+  // Try to find the input, even if it's inside a shadow DOM
+  let input = page.locator(inputSelector).first();
+  if (!(await input.isVisible().catch(() => false))) {
+    // If not visible, it might be inside the mc-c-origin-destination component's shadow DOM
+    // or just not matching the ID selector directly. Maersk sometimes uses mc-typeahead.
+    const isOrigin = inputSelector.includes('origin');
+    input = page.locator(`${isOrigin ? 'mc-typeahead[id*="origin"]' : 'mc-typeahead[id*="destination"]'} input, ${isOrigin ? '#mc-input-origin' : '#mc-input-destination'}`).first();
   }
 
-  const username = process.env.MAERSK_USERNAME;
-  const password = process.env.MAERSK_PASSWORD;
-  if (!username || !password) {
-    console.warn('[Login] WARNING: MAERSK_USERNAME / MAERSK_PASSWORD not set in .env');
-    throw new Error('Not logged in and credentials missing. Please check .env or log in manually in the persistent profile.');
-  }
-
-  // Rate-limit guard - ONLY trigger if we actually need to log in
-  if (fs.existsSync(LOCKOUT_FILE)) {
-    const last = parseInt(fs.readFileSync(LOCKOUT_FILE, 'utf8'), 10);
-    const elapsed = Date.now() - last;
-    if (elapsed < MIN_LOGIN_INTERVAL_MS) {
-      const wait = Math.ceil((MIN_LOGIN_INTERVAL_MS - elapsed) / 1000);
-      console.log('[Login] Rate-limited: ' + wait + 's remaining');
-      throw new Error('Rate-limited: wait ' + wait + 's before retrying');
-    }
-  }
-  fs.writeFileSync(LOCKOUT_FILE, String(Date.now()), 'utf8');
-
-  // Read-only 403 logger
-  page.on('response', (resp) => {
-    if (resp.status() === 403) {
-      console.log('[Login] 403 response: ' + resp.url().substring(0, 100));
-    }
-  });
-
-  // Fill credentials with human-like typing
-  console.log('[Login] Filling credentials...');
-  await page.waitForTimeout(humanDelay(1500, 1500));
-  await dismissOverlays(page);
-
-  const usernameInput = page.locator('#mc-input-username');
-  await usernameInput.waitFor({ state: 'visible', timeout: 15000 });
-  await usernameInput.click();
-  await page.waitForTimeout(humanDelay(400, 300));
-
-  // Type character by character
-  for (const ch of username) {
-    await usernameInput.press(ch);
-    await page.waitForTimeout(humanDelay(60, 100));
-  }
-  await page.waitForTimeout(humanDelay(600, 400));
-
-  // Tab to password
-  await page.keyboard.press('Tab');
-  await page.waitForTimeout(humanDelay(300, 300));
-
-  const passwordInput = page.locator('input[name="password"]:visible');
-  await passwordInput.waitFor({ state: 'visible', timeout: 5000 });
-
-  for (const ch of password) {
-    await passwordInput.press(ch);
-    await page.waitForTimeout(humanDelay(50, 90));
-  }
-  await page.waitForTimeout(humanDelay(800, 500));
-  await dismissOverlays(page);
-
-  // Submit
-  console.log('[Login] Submitting...');
-  await page.locator('button[type="submit"]').click();
-
-  // Wait for OIDC chain
-  const loginDeadline = Date.now() + 90000;
-  let loggedIn = false;
-  let isRecoveryPage = false;
-  let retryLoginDone = false;
-
-  try { await page.waitForTimeout(12000); } catch { /* page may close */ }
-
-  while (Date.now() < loginDeadline) {
-    try { await page.waitForTimeout(3000); } catch { /* page closed */ }
-
-    if (!isPageAlive(page)) {
-      console.log('[Login] Page closed - opening new page...');
-      if (!isContextAlive(context)) {
-        console.log('[Login] Browser context is dead - cannot recover');
-        throw new Error('Browser context destroyed during login');
-      }
-      try {
-        page = await context.newPage();
-        await hardenPage(page);
-        isRecoveryPage = true;
-        page.on('response', (resp) => {
-          if (resp.status() === 403) {
-            console.log('[Login] 403 on recovery: ' + resp.url().substring(0, 100));
-          }
-        });
-        await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(humanDelay(4000, 2000));
-        await dismissOverlays(page);
-      } catch (e) {
-        console.log('[Login] New page error: ' + e.message.substring(0, 80));
-        if (e.message.includes('has been closed') || e.message.includes('destroyed')) {
-          throw new Error('Browser context destroyed during login');
-        }
-        continue;
-      }
-    }
-
-    // Booking form visible = logged in
-    try {
-      if (await page.locator('#mc-input-origin').isVisible({ timeout: 2000 }).catch(() => false)) {
-        loggedIn = true;
-        break;
-      }
-    } catch { continue; }
-
-    let currentUrl = '';
-    try { currentUrl = page.url(); } catch { continue; }
-    const remaining = Math.ceil((loginDeadline - Date.now()) / 1000);
-    console.log('[Login] ' + remaining + 's left | ' + currentUrl.substring(0, 80));
-
-    // Recovery: re-fill on NEW page only
-    if (isRecoveryPage && !retryLoginDone &&
-      currentUrl.includes('accounts.maersk.com') && currentUrl.includes('/auth/login')) {
-      const uInput = page.locator('#mc-input-username');
-      const uVisible = await uInput.isVisible({ timeout: 2000 }).catch(() => false);
-      if (uVisible) {
-        console.log('[Login] Recovery: re-filling credentials...');
-        retryLoginDone = true;
-        try {
-          await dismissOverlays(page);
-          await uInput.click();
-          await page.waitForTimeout(humanDelay(400, 300));
-          for (const ch of username) {
-            await uInput.press(ch);
-            await page.waitForTimeout(humanDelay(60, 100));
-          }
-          await page.waitForTimeout(humanDelay(500, 400));
-          await page.keyboard.press('Tab');
-          await page.waitForTimeout(humanDelay(300, 200));
-          const pInput = page.locator('input[name="password"]:visible');
-          for (const ch of password) {
-            await pInput.press(ch);
-            await page.waitForTimeout(humanDelay(50, 90));
-          }
-          await page.waitForTimeout(humanDelay(800, 400));
-          console.log('[Login] Recovery: submitting...');
-          await page.locator('button[type="submit"]').click();
-          await page.waitForTimeout(12000);
-        } catch (e) {
-          console.log('[Login] Recovery error: ' + e.message.substring(0, 80));
-        }
-        continue;
-      }
-    }
-
-    // Landed on www.maersk.com but not /book/
-    if (currentUrl.startsWith('https://www.maersk.com') && !currentUrl.includes('/book')) {
-      try {
-        if (currentUrl.includes('why-upgrade')) {
-          const laterBtn = page.locator('text=Complete later').first();
-          if (await laterBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-            console.log('[Login] Clicking "Complete later"...');
-            await laterBtn.click();
-            await page.waitForTimeout(3000);
-          }
-        }
-        if (!page.url().includes('/book')) {
-          console.log('[Login] Navigating to /book/...');
-          await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          await page.waitForTimeout(humanDelay(3000, 2000));
-          await dismissOverlays(page);
-        }
-      } catch (e) {
-        console.log('[Login] Nav error: ' + e.message.substring(0, 80));
-      }
-    }
-  }
-
-  if (loggedIn) {
-    console.log('[Login] SUCCESS - booking form ready');
-    return page;
-  }
-
-  // Last resort: wait for human
-  console.log('[Login] Auto-login incomplete. URL: ' + (isPageAlive(page) ? page.url() : 'page closed'));
-  await screenshot(page, 'login_incomplete').catch(() => { });
-
-  console.log('\n=== WAITING for login in browser window (2 min) ===\n');
-
-  const humanDeadline2 = Date.now() + 120000;
-  while (Date.now() < humanDeadline2) {
-    try { await page.waitForTimeout(5000); } catch { }
-
-    if (!isPageAlive(page)) {
-      if (!isContextAlive(context)) {
-        console.log('[Login] Browser context is dead in manual wait');
-        throw new Error('Browser context destroyed - cannot recover');
-      }
-      try {
-        page = await context.newPage();
-        await hardenPage(page);
-        await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(3000);
-      } catch (e) {
-        if (e.message.includes('has been closed') || e.message.includes('destroyed')) {
-          throw new Error('Browser context destroyed - cannot recover');
-        }
-        continue;
-      }
-    }
-
-    try {
-      if (await page.locator('#mc-input-origin').isVisible({ timeout: 2000 }).catch(() => false)) {
-        console.log('[Login] Booking form detected!');
-        return page;
-      }
-    } catch { }
-
-    console.log('[Login] Waiting... ' + Math.ceil((humanDeadline2 - Date.now()) / 1000) + 's remaining');
-  }
-
-  throw new Error('Login failed - booking form not visible after all retries');
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// FILL COMBOBOX
-// ══════════════════════════════════════════════════════════════════════════
-
-async function fillCombobox(page, selector, text, label) {
-  console.log('[Form] ' + label + ': "' + text + '"');
-  const input = typeof selector === 'string' ? page.locator(selector) : selector;
-  await input.waitFor({ state: 'visible', timeout: 10000 });
-  await input.scrollIntoViewIfNeeded().catch(() => { });
+  // Click to focus
+  await input.click({ force: true });
+  await page.waitForTimeout(800);
+  
+  // Clear existing value
+  await page.keyboard.press('Control+A');
+  await page.keyboard.press('Backspace');
   await page.waitForTimeout(500);
-
-  // Strategies: try multiple typing approaches
-  const strategies = [
-    { name: 'pressSequentially', textFn: (t) => t },
-    { name: 'keyboard.insertText', textFn: (t) => t },
-    { name: 'pressSequentially-short', textFn: (t) => t.split(/[\s,]+/)[0] },
-  ];
-
-  for (let attempt = 0; attempt < strategies.length; attempt++) {
-    const strategy = strategies[attempt];
-    const textToType = strategy.textFn(text);
-    console.log('[Form] ' + label + ': attempt ' + (attempt + 1) + '/' + strategies.length + ' (' + strategy.name + ') text="' + textToType + '"');
-
-    // Step 1: Click to focus
-    await input.click();
-    await page.waitForTimeout(humanDelay(300, 200));
-
-    // Step 2: Clear existing text
-    await input.click({ clickCount: 3 });
-    await page.waitForTimeout(200);
-    await page.keyboard.press('Backspace');
-    await page.waitForTimeout(300);
-    // Verify cleared
-    const clearedVal = await safeInputValue(input);
-    if (clearedVal && clearedVal.length > 0) {
-      await input.fill('').catch(() => { });
-      await page.waitForTimeout(300);
-    }
-
-    // Step 3: Type using the current strategy
-    if (strategy.name === 'keyboard.insertText') {
-      // insertText fires a single 'input' event — some web components respond to this
-      await input.click();
-      await page.waitForTimeout(120);
-      await page.keyboard.insertText(textToType);
-    } else {
-      // pressSequentially fires individual key events
-      await input.pressSequentially(textToType, { delay: humanDelay(60, 40) });
-    }
-    await page.waitForTimeout(600);
-
-    // Step 4: Verify the input received the text
-    const typedVal = await safeInputValue(input);
-    console.log('[Form] ' + label + ': typed value = "' + typedVal + '"');
-    if (!typedVal || typedVal.length < 2) {
-      console.log('[Form] ' + label + ': text not received, trying JS event dispatch...');
-      await input.evaluate((el, val) => {
-        el.value = val;
-        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true, key: val.slice(-1) }));
-      }, textToType).catch(() => { });
-      await page.waitForTimeout(500);
-      const jsVal = await safeInputValue(input);
-      console.log('[Form] ' + label + ': after JS dispatch value = "' + jsVal + '"');
-    }
-
-    // Step 5: Wait for dropdown (location API needs time)
-    await page.waitForTimeout(humanDelay(3000, 2000));
-
-    // Step 6: Check for dropdown options (multiple selectors)
-    const dropdownSelectors = [
-      'li[role="option"]', '[role="option"]', '[role="listbox"] li',
-      'ul[role="listbox"] li', 'mds-listbox-option', 'mc-option',
-    ];
-    for (const sel of dropdownSelectors) {
-      const opts = page.locator(sel).filter({ visible: true });
-      const count = await opts.count().catch(() => 0);
-      if (count > 0) {
-        // Try to find an option that looks like it matches, otherwise take first visible
-        let bestOpt = opts.first();
-        for (let i = 0; i < Math.min(count, 5); i++) {
-          const optText = await opts.nth(i).textContent().catch(() => '');
-          if (optText.toLowerCase().includes(text.toLowerCase())) {
-            bestOpt = opts.nth(i);
-            break;
-          }
-        }
-        const t = await bestOpt.textContent().catch(() => '');
-        console.log('[Form] ' + label + ' selected: "' + t.trim() + '" (attempt ' + (attempt + 1) + ', ' + strategy.name + ')');
-        await bestOpt.click().catch(async () => {
-          await bestOpt.click({ force: true });
-        });
-        await page.waitForTimeout(800);
-        return true;
-      }
-    }
-
-    // Step 7: Log what's visible for debugging
-    const optCount = await page.locator('[role="option"]').count().catch(() => 0);
-    const lbCount = await page.locator('[role="listbox"]').count().catch(() => 0);
-    console.log('[Form] ' + label + ': no visible dropdown (options=' + optCount + ' listboxes=' + lbCount + ')');
-
-    // Escape before next attempt
-    await page.keyboard.press('Escape');
-    await page.waitForTimeout(300);
-  }
-
-  // Last resort: ArrowDown+Enter
-  console.log('[Form] ' + label + ': all strategies failed — trying ArrowDown+Enter');
-  await input.click();
-  await page.waitForTimeout(120);
-  await input.press('ArrowDown');
-  await page.waitForTimeout(120);
-  await input.press('Enter');
-  await page.waitForTimeout(300);
-  return false;
+  
+  // Type the value
+  await page.keyboard.type(sanitizedValue, { delay: 150 });
+  
+  console.log(`[Scraper] Waiting for ${fieldName} autocomplete results...`);
+  await page.waitForTimeout(3500);
+  
+  // Dispatch events
+  await input.evaluate((el) => {
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  });
+  
+  await page.waitForTimeout(1000);
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// MAIN SCRAPER — uses launchPersistentContext to reuse cookies/sessions
-// ══════════════════════════════════════════════════════════════════════════
+/**
+ * Select option from Maersk autocomplete dropdown
+ */
+async function selectDropdownOption(page, searchText, fieldName) {
+  const sanitizedSearchText = searchText.includes('(') ? searchText.split('(')[0].trim() : searchText;
+  console.log(`[Scraper] Selecting dropdown option for ${fieldName} (searching for "${sanitizedSearchText}")...`);
+  
+  // Wait for dropdown options to appear
+  await page.waitForTimeout(2000);
+  
+  // Check if listbox is visible
+  const listbox = page.locator('[role="listbox"]').first();
+  const listboxVisible = await listbox.isVisible({ timeout: 5000 }).catch(() => false);
+  console.log(`[Scraper] Listbox visible: ${listboxVisible}`);
+  
+  if (!listboxVisible) {
+    console.log(`[Scraper] No listbox visible, pressing ArrowDown to trigger...`);
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(1500);
+  }
+  
+  // Count available options
+  const options = page.locator('[role="option"]');
+  const optionCount = await options.count();
+  console.log(`[Scraper] Found ${optionCount} options in dropdown`);
+  
+  if (optionCount === 0) {
+    console.log(`[Scraper] Still no options found, trying fuzzy search...`);
+    // Final attempt: wait longer
+    await page.waitForTimeout(2000);
+    if (await options.count() === 0) {
+      console.log(`[Scraper] ERROR: No options ever appeared for ${fieldName}`);
+      return false;
+    }
+  }
+  
+  // Try to find an option that matches the search text
+  const searchTextLower = sanitizedSearchText.toLowerCase();
+  const originTextLower = searchText.toLowerCase();
+  
+  // Get all options and their text
+  const optionElements = await options.all();
+  let bestMatch = null;
 
+  for (const option of optionElements) {
+    const text = (await option.textContent().catch(() => '')).trim();
+    const textLower = text.toLowerCase();
+    
+    // Exact or close match
+    if (textLower === searchTextLower || textLower === originTextLower || textLower.startsWith(searchTextLower)) {
+      console.log(`[Scraper] Found matching option: "${text}"`);
+      bestMatch = option;
+      break;
+    }
+
+    // Contains sanitized or original
+    if (textLower.includes(searchTextLower) || textLower.includes(originTextLower)) {
+      if (!bestMatch) bestMatch = option;
+    }
+  }
+
+  if (bestMatch) {
+    await bestMatch.scrollIntoViewIfNeeded();
+    await page.waitForTimeout(200);
+    await bestMatch.click({ force: true });
+    await page.waitForTimeout(1500);
+    return true;
+  }
+  
+  // Fallback: click first option
+  console.log(`[Scraper] No match found for "${sanitizedSearchText}", clicking first option as fallback`);
+  const firstOption = options.first();
+  const firstText = (await firstOption.textContent().catch(() => '')).trim();
+  console.log(`[Scraper] Clicking first option: "${firstText}"`);
+  await firstOption.click({ force: true });
+  await page.waitForTimeout(1500);
+  
+  return true;
+}
+
+/**
+ * Live scrape from Maersk booking portal
+ */
 async function scrapeMaerskSpotRate(params) {
-  const jobId = params.job_id || uuidv4();
-  const startTime = Date.now();
+  const {
+    from_port, to_port, container_type = '40FT',
+    number_of_containers = 1, weight_per_container,
+    weight_unit = 'KG', ship_date, commodity,
+    job_id,
+  } = params;
+
+  console.log(`[Scraper LIVE] Job ${job_id} | ${from_port} → ${to_port} | ${container_type}`);
+
   let context = null;
+  let snapshotId = null;
 
   try {
-    const { chromium } = require('playwright');
-
-    console.log('\n[Scraper] === Job ' + jobId + ' ===');
-    console.log('[Scraper] Route: ' + params.from_port + ' -> ' + params.to_port);
-
-    // Launch Edge with PERSISTENT CONTEXT — reuses cookies between sessions
-    // This is critical: Akamai _abck sensor cookie persists, avoiding 403
-    console.log('[Scraper] Using persistent profile: ' + PROFILE_DIR);
+    // Launch persistent browser context
     context = await chromium.launchPersistentContext(PROFILE_DIR, {
-      headless: true,
+      headless: process.env.SCRAPER_HEADLESS !== 'false',
       channel: 'msedge',
-      slowMo: 50,  // Reduced slowMo since it's headless now
       viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
       locale: 'en-US',
-      timezoneId: 'Asia/Kolkata',
+      timezoneId: 'Asia/Singapore',
       args: [
         '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--start-maximized',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--no-first-run',
         '--no-default-browser-check',
-        '--disable-component-update',
-        '--disable-features=RendererCodeIntegrity',
       ],
     });
 
-    // Apply stealth at context level so ALL pages (including recovery) get it
-    await context.addInitScript(() => {
-      window.close = function () { };
+    const page = context.pages()[0] || await context.newPage();
+
+    // Minimal stealth to hide automation
+    await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
-      if (!window.chrome) window.chrome = {};
-      if (!window.chrome.runtime) window.chrome.runtime = { connect: function () { }, sendMessage: function () { } };
     });
 
-    // Use the first page from persistent context — do NOT create extra blank tabs
-    // launchPersistentContext always provides at least one page
-    let page = context.pages()[0];
-    // Close any extra about:blank tabs to avoid "2 blank tabs" issue
-    const existingPages = context.pages();
-    for (let i = 1; i < existingPages.length; i++) {
+    // Navigate to booking page with retry
+    console.log('[Scraper] Navigating to Maersk booking page...');
+    let navigated = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        if (existingPages[i].url() === 'about:blank' || existingPages[i].url() === '') {
-          await existingPages[i].close();
-        }
-      } catch { }
-    }
-    console.log('[Scraper] Using initial context page (tabs: ' + context.pages().length + ')');
-
-    // STEP 1: LOGIN
-    page = await loginToMaersk(page, context);
-    await screenshot(page, '01_logged_in');
-
-    // ALWAYS navigate to a fresh booking page to clear any previous form data
-    console.log('[Form] Navigating to fresh booking page to clear previous data...');
-    await page.goto(MAERSK_BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
-    // Wait for booking form to load
-    await page.locator('#mc-input-origin').waitFor({ state: 'visible', timeout: 15000 }).catch(() => { });
-    await page.waitForTimeout(2000);
-    await dismissOverlays(page);
-    console.log('[Form] Fresh booking page loaded — filling all fields from scratch');
-
-    // Read-only response listener for API extraction + location API monitoring
-    const apiResponses = [];
-    page.on('response', async (resp) => {
-      const url = resp.url();
-      // Monitor location search API (used by origin/destination autocomplete)
-      if (url.includes('/geography/locations') || url.includes('/location')) {
-        const query = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-        console.log('[API] Location search: status=' + resp.status() + ' ' + query.substring(0, 120));
-        try {
-          const body = await resp.json().catch(() => null);
-          if (body) {
-            const count = Array.isArray(body) ? body.length : (body.locations?.length || body.results?.length || '?');
-            console.log('[API] Location results: ' + count + ' locations returned');
-          }
-        } catch { }
+        await page.goto(BOOK_URL, { waitUntil: 'domcontentloaded', timeout: DEFAULT_TIMEOUT });
+        navigated = true;
+        break;
+      } catch (e) {
+        console.warn(`[Scraper] Navigation attempt ${attempt} failed: ${e.message}`);
+        if (attempt === 1) await page.waitForTimeout(3000);
       }
-      if (url.includes('/price') || url.includes('/rate') || url.includes('/offer') ||
-        url.includes('/schedule') || url.includes('/quotation')) {
-        try {
-          const body = await resp.json().catch(() => null);
-          if (body) apiResponses.push({ url, status: resp.status(), body });
-        } catch { }
-      }
-    });
-
-    // STEP 2: CLEAR any lingering values in origin field, then fill fresh
-    const originInput = page.locator('#mc-input-origin');
-    const existingOrigin = await safeInputValue(originInput);
-    if (existingOrigin && existingOrigin.trim()) {
-      console.log('[Form] Clearing previous origin: "' + existingOrigin + '"');
-      await originInput.click({ clickCount: 3 });
-      await originInput.fill('');
-      await page.waitForTimeout(500);
-      // Dismiss any dropdown that appeared
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(500);
     }
+    
+    if (!navigated) throw new Error('Failed to navigate to Maersk after 2 attempts');
+    
+    await page.waitForTimeout(8000); // Increased wait for heavy components
 
-    // STEP 3: ORIGIN — always fill with user's data
-    await fillCombobox(page, '#mc-input-origin', params.from_port, 'Origin');
-    // Wait longer after origin selection for destination to become available
-    await page.waitForTimeout(5000);
-
-    // STEP 4: DESTINATION — The mc-c-origin-destination web component has both inputs in shadow DOM
-    // After origin is selected, the destination input should become available
-    console.log('[Form] Looking for destination input...');
-
-    // Try multiple selectors for destination with increasing timeouts
-    const destSelectors = [
-      '#mc-input-destination',
-      'mc-c-origin-destination input[role="combobox"]:not([id="mc-input-origin"])',
-      'input[id*="destination"][role="combobox"]',
-      'input[placeholder*="city or port" i]:not([id="mc-input-origin"])',
-      'input[placeholder*="destination" i]',
-      'input[placeholder*="delivery" i]',
+    // Dismiss cookie banner if present - handle multiple formats
+    const cookieSelectors = [
+      '.coi-banner__accept',
+      '[data-test*="cookie-accept"]',
+      '#accept-cookies',
+      '.mds-cookie-banner__button--accept',
+      'mc-button:has-text("Accept")',
+      'mc-button:has-text("Close")'
     ];
-
-    let destLoc = null;
-    let destVis = false;
-
-    for (let attempt = 0; attempt < 5; attempt++) {
-      for (const sel of destSelectors) {
-        const loc = page.locator(sel).first();
-        const vis = await loc.isVisible({ timeout: 2000 }).catch(() => false);
-        if (vis) {
-          destLoc = loc;
-          destVis = true;
-          const destId = await loc.getAttribute('id').catch(() => 'unknown');
-          console.log('[Form] Destination input found with selector: ' + sel + ' (id=' + destId + ')');
-          break;
-        }
-      }
-      if (destVis) break;
-
-      // Fallback: find all combobox inputs and pick the one that's not origin
-      const allCbs = page.locator('input[role="combobox"]');
-      const cbCount = await allCbs.count().catch(() => 0);
-      console.log('[Form] Found ' + cbCount + ' combobox inputs (attempt ' + (attempt + 1) + '/5)');
-      for (let i = 0; i < cbCount; i++) {
-        const id = await allCbs.nth(i).getAttribute('id').catch(() => '');
-        const vis = await allCbs.nth(i).isVisible({ timeout: 1000 }).catch(() => false);
-        console.log('[Form]   Combobox #' + (i + 1) + ': id=' + id + ' visible=' + vis);
-        if (id !== 'mc-input-origin' && id !== 'mc-input-username' && vis) {
-          destLoc = allCbs.nth(i);
-          destVis = true;
-          console.log('[Form] Using combobox #' + (i + 1) + ' as destination (id=' + id + ')');
-          break;
-        }
-      }
-      if (destVis) break;
-
-      console.log('[Form] Destination not found yet, waiting (attempt ' + (attempt + 1) + '/5)...');
-      await page.waitForTimeout(3000);
-    }
-
-    if (destVis && destLoc) {
-      // Keep it simple — just call fillCombobox like we do for origin
-      // Do NOT pre-process (click, escape, etc.) — that confuses the web component
-      await fillCombobox(page, destLoc, params.to_port, 'Destination');
-      await page.waitForTimeout(2000);
-    } else {
-      console.log('[Form] WARNING: Could not find destination input — form will be incomplete');
-    }
-
-    await page.waitForTimeout(2000);
-
-    // STEP 4b: INLAND TRANSPORT — select CY or SD radio buttons
-    await dismissOverlays(page);
-    const originInland = (params.origin_inland || 'CY').toUpperCase();
-    const destInland = (params.destination_inland || 'CY').toUpperCase();
-    console.log('[Form] Inland transport: origin=' + originInland + ', destination=' + destInland);
-
-    // Origin inland: look for radio/toggle buttons near origin
-    // Maersk uses radio buttons or toggle cards with CY/SD labels
-    try {
-      // Try multiple selectors for the inland transport toggles
-      // Origin CY/SD — typically the first set of radio/toggle buttons
-      const originRadios = page.locator(
-        'mc-c-inland-transport:first-of-type input[type="radio"], ' +
-        '[data-test*="origin"][data-test*="inland"] input[type="radio"], ' +
-        '[data-test*="origin"][data-test*="transport"] input[type="radio"]'
-      );
-      const originRadioCount = await originRadios.count().catch(() => 0);
-
-      if (originRadioCount > 0) {
-        // Click the matching radio
-        for (let i = 0; i < originRadioCount; i++) {
-          const val = await originRadios.nth(i).getAttribute('value').catch(() => '');
-          if (val && val.toUpperCase() === originInland) {
-            await originRadios.nth(i).click({ force: true });
-            console.log('[Form] Origin inland radio clicked: ' + originInland);
-            break;
-          }
-        }
-      } else {
-        // Fallback: look for buttons/labels with CY or SD text in the origin section
-        const allInlandBtns = page.locator(
-          'mc-c-inland-transport, [class*="inland"], [data-test*="inland"]'
-        );
-        const inlandCount = await allInlandBtns.count().catch(() => 0);
-        console.log('[Form] Found ' + inlandCount + ' inland transport sections');
-
-        if (inlandCount >= 1) {
-          // First section = origin
-          const originSection = allInlandBtns.nth(0);
-          if (originInland === 'SD') {
-            const sdBtn = originSection.locator('label:has-text("SD"), button:has-text("SD"), [data-test*="sd"], input[value="SD"]').first();
-            if (await sdBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await sdBtn.click({ force: true });
-              console.log('[Form] Origin SD selected via label/button');
-            }
-          } else {
-            const cyBtn = originSection.locator('label:has-text("CY"), button:has-text("CY"), [data-test*="cy"], input[value="CY"]').first();
-            if (await cyBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await cyBtn.click({ force: true });
-              console.log('[Form] Origin CY selected via label/button');
-            }
-          }
-        }
-
-        // Second section = destination (if exists)
-        if (inlandCount >= 2) {
-          const destSection = allInlandBtns.nth(1);
-          if (destInland === 'SD') {
-            const sdBtn = destSection.locator('label:has-text("SD"), button:has-text("SD"), [data-test*="sd"], input[value="SD"]').first();
-            if (await sdBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await sdBtn.click({ force: true });
-              console.log('[Form] Destination SD selected via label/button');
-            }
-          } else {
-            const cyBtn = destSection.locator('label:has-text("CY"), button:has-text("CY"), [data-test*="cy"], input[value="CY"]').first();
-            if (await cyBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await cyBtn.click({ force: true });
-              console.log('[Form] Destination CY selected via label/button');
-            }
-          }
-        }
-      }
-
-      // Also try generic approach: all radio inputs with value CY or SD on the page
-      if (originRadioCount === 0) {
-        const allRadios = page.locator('input[type="radio"]');
-        const radioCount = await allRadios.count().catch(() => 0);
-        let cyRadios = [];
-        let sdRadios = [];
-        for (let i = 0; i < radioCount; i++) {
-          const val = (await allRadios.nth(i).getAttribute('value').catch(() => ''))?.toUpperCase();
-          if (val === 'CY') cyRadios.push(i);
-          if (val === 'SD') sdRadios.push(i);
-        }
-        console.log('[Form] Found ' + cyRadios.length + ' CY radios, ' + sdRadios.length + ' SD radios');
-        // Origin = first pair, Destination = second pair
-        if (cyRadios.length >= 1 && sdRadios.length >= 1) {
-          if (originInland === 'SD' && sdRadios.length >= 1) {
-            const r = allRadios.nth(sdRadios[0]);
-            await r.scrollIntoViewIfNeeded().catch(() => { });
-            await r.click({ force: true });
-            console.log('[Form] Origin SD selected (generic radio)');
-          } else if (originInland === 'CY' && cyRadios.length >= 1) {
-            const r = allRadios.nth(cyRadios[0]);
-            await r.scrollIntoViewIfNeeded().catch(() => { });
-            await r.click({ force: true });
-            console.log('[Form] Origin CY selected (generic radio)');
-          }
-        }
-        if (cyRadios.length >= 2 && sdRadios.length >= 2) {
-          if (destInland === 'SD') {
-            const r = allRadios.nth(sdRadios[1]);
-            await r.scrollIntoViewIfNeeded().catch(() => { });
-            await r.click({ force: true });
-            console.log('[Form] Destination SD selected (generic radio)');
-          } else {
-            const r = allRadios.nth(cyRadios[1]);
-            await r.scrollIntoViewIfNeeded().catch(() => { });
-            await r.click({ force: true });
-            console.log('[Form] Destination CY selected (generic radio)');
-          }
-        }
-      }
-    } catch (e) {
-      console.log('[Form] Inland transport selection error (non-fatal): ' + e.message.substring(0, 100));
-    }
-    await page.waitForTimeout(1000);
-    await screenshot(page, '03_route');
-
-    // STEP 5: COMMODITY — always clear and fill fresh
-    await dismissOverlays(page);
-    const comIn = page.locator('mc-c-commodity input[role="combobox"], input[placeholder*="commodity" i]').first();
-    const comVis = await comIn.isVisible({ timeout: 3000 }).catch(() => false);
-    if (comVis && !(await comIn.isDisabled().catch(() => true))) {
-      // Clear any previous commodity value
-      const comVal = await safeInputValue(comIn);
-      if (comVal && comVal.trim()) {
-        console.log('[Form] Clearing previous commodity: "' + comVal + '"');
-        await comIn.click({ clickCount: 3 });
-        await comIn.fill('');
-        await page.waitForTimeout(500);
-        await page.keyboard.press('Escape');
-        await page.waitForTimeout(500);
-      }
-      const commodity = params.commodity || 'General';
-      console.log('[Form] Commodity: "' + commodity + '"');
-      await comIn.click(); await page.waitForTimeout(300);
-      await comIn.pressSequentially(commodity, { delay: 100 });
-      await page.waitForTimeout(3000);
-      const cOpts = page.locator('li[role="option"], mc-option, [role="option"]').filter({ visible: true });
-      if (await cOpts.count().catch(() => 0) > 0) {
-        await cOpts.first().click().catch(() => cOpts.first().click({ force: true }));
-      }
-      else { await comIn.press('ArrowDown'); await page.waitForTimeout(500); await comIn.press('Enter'); }
-      await page.waitForTimeout(1500);
-    }
-
-    // STEP 6: CONTAINER
-    await page.waitForTimeout(3000);
-    const contIn = page.locator('input[placeholder*="container type" i]:not([disabled]), mc-c-container-select input[role="combobox"]:not([disabled])').first();
-    let contReady = false;
-    for (let i = 0; i < 5; i++) {
-      contReady = await contIn.isVisible({ timeout: 2000 }).catch(() => false);
-      if (contReady && !(await contIn.isDisabled().catch(() => true))) break;
-      contReady = false;
-      await page.waitForTimeout(2000);
-    }
-    if (contReady) {
-      // Clear any previous container type
-      const existingCont = await safeInputValue(contIn);
-      if (existingCont && existingCont.trim()) {
-        console.log('[Form] Clearing previous container: "' + existingCont + '"');
-        await contIn.click({ clickCount: 3 });
-        await contIn.fill('');
-        await page.waitForTimeout(500);
-        await page.keyboard.press('Escape');
-        await page.waitForTimeout(500);
-      }
-      const ct = mapContainer(params.container_type);
-      console.log('[Form] Container: ' + ct);
-      await contIn.click(); await page.waitForTimeout(500);
-      await contIn.pressSequentially(ct, { delay: 100 });
-      await page.waitForTimeout(2000);
-      const ctOpts = page.locator('li[role="option"], mc-option, [role="option"]').filter({ visible: true });
-      if (await ctOpts.count().catch(() => 0) > 0) {
-        await ctOpts.first().click().catch(() => ctOpts.first().click({ force: true }));
-      }
-      else { await contIn.press('ArrowDown'); await page.waitForTimeout(500); await contIn.press('Enter'); }
-      await page.waitForTimeout(1000);
-    }
-
-    // Quantity — always overwrite
-    const qtyIn = page.locator('mc-c-container-select input[type="number"], input[data-test*="quantity"]').first();
-    if (await qtyIn.isVisible({ timeout: 2000 }).catch(() => false) && !(await qtyIn.isDisabled().catch(() => true))) {
-      await qtyIn.click({ clickCount: 3 });
-      await qtyIn.fill(String(params.number_of_containers || 1));
-      console.log('[Form] Quantity: ' + (params.number_of_containers || 1));
-    }
-
-    // STEP 6b: WEIGHT
-    // RCA: Previously, weight was not always filled due to selector mismatch or unit confusion.
-    // Now: Only convert if unit is lb, otherwise keep as kg. Always fill the website in kg.
-    // Improved: Add more robust selector and error logging/screenshots for debugging.
-    if (params.weight_per_container) {
-      let weightToFill = params.weight_per_container;
-      let unit = (params.weight_unit || 'kg').toLowerCase();
-      if (unit === 'lb' || unit === 'lbs') {
-        // Convert pounds to kg (1 lb = 0.453592 kg)
-        weightToFill = (parseFloat(weightToFill) * 0.453592).toFixed(2);
-        unit = 'kg';
-      }
-      // Try multiple selectors, including shadow DOM if needed
-      let weightIn = page.locator('input[data-test*="weight"], input[placeholder*="weight" i], input[name*="weight" i]').first();
-      if (!(await weightIn.isVisible({ timeout: 2000 }).catch(() => false))) {
-        // Try a more generic selector as fallback
-        weightIn = page.locator('input[type="number"]').filter({ hasText: '' }).first();
-      }
-      if (!(await weightIn.isVisible({ timeout: 2000 }).catch(() => false))) {
-        // Try to find any visible input in the container weight section
-        const allInputs = await page.locator('input').all();
-        for (const inp of allInputs) {
-          const ph = await inp.getAttribute('placeholder').catch(() => '');
-          if (ph && ph.toLowerCase().includes('weight')) {
-            weightIn = inp;
-            break;
-          }
-        }
-      }
-      if (!(await weightIn.isVisible({ timeout: 2000 }).catch(() => false))) {
-        console.log('[Form][ERROR] Weight input not found or not visible!');
-        await screenshot(page, 'weight_input_not_found');
-      } else if (await weightIn.isDisabled().catch(() => true)) {
-        console.log('[Form][ERROR] Weight input is disabled!');
-        await screenshot(page, 'weight_input_disabled');
-      } else {
-        await weightIn.click({ clickCount: 3 });
-        await weightIn.fill(String(weightToFill));
-        console.log(`[Form] Weight: ${weightToFill} kg (original: ${params.weight_per_container} ${params.weight_unit || 'kg'})`);
-        await screenshot(page, 'weight_filled');
-      }
-    }
-
-    // STEP 7: DATE — only fill if user explicitly provides a ship_date
-    // Ship date is NOT a required field for getting results
-    if (params.ship_date && params.ship_date.trim()) {
-      const fd = fmtDate(params.ship_date);
-      console.log('[Form] Date: ' + fd + ' (user-provided)');
-      const dateIn = page.locator('mc-input-date#earliestDepartureDatePicker input, #earliestDepartureDatePicker input, input[placeholder*="DD MMM"]').first();
-      const dateVis = await dateIn.isVisible({ timeout: 3000 }).catch(() => false);
-      if (dateVis && !(await dateIn.isDisabled().catch(() => true))) {
-        await dateIn.click({ clickCount: 3 });
-        await page.waitForTimeout(300);
-        await dateIn.fill('');
-        await page.waitForTimeout(300);
-        await dateIn.pressSequentially(fd, { delay: 80 });
-        await page.waitForTimeout(500);
-        await dateIn.press('Tab');
+    
+    for (const selector of cookieSelectors) {
+      const btn = page.locator(selector).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click({ force: true });
+        console.log(`[Scraper] Cookie/Overlay dismissed with: ${selector}`);
         await page.waitForTimeout(1000);
-        console.log('[Form] Date filled successfully');
-      } else {
-        console.log('[Form] Date input not accessible — skipping');
       }
-    } else {
-      console.log('[Form] Date: skipped (not provided by user)');
     }
 
-    await screenshot(page, '06_form');
-
-    // STEP 8: SUBMIT (Maersk uses "Continue to book" button, NOT "Search")
-    await dismissOverlays(page);
-    await page.waitForTimeout(2000);
-
-    // Wait for the submit button to become enabled
-    const submitBtn = page.locator(
-      'mc-button[data-test="buttonSubmit"], #od3cpContinueButton, mc-button:has-text("Continue to book"), mc-button:has-text("Continue"), button[data-test="buttonSubmit"]'
-    ).first();
-
-    let btnClicked = false;
-    for (let btnAttempt = 0; btnAttempt < 5; btnAttempt++) {
-      const btnVis = await submitBtn.isVisible({ timeout: 3000 }).catch(() => false);
-      if (!btnVis) {
-        console.log('[Scraper] Submit button not visible (attempt ' + (btnAttempt + 1) + '/5)');
-        await page.waitForTimeout(2000);
-        continue;
-      }
-
-      // Check if disabled
-      const isDisabled = await submitBtn.evaluate(el => {
-        return el.hasAttribute('disabled') || el.getAttribute('disabled') === '' || el.disabled;
-      }).catch(() => true);
-
-      if (isDisabled) {
-        console.log('[Scraper] Submit button is disabled (attempt ' + (btnAttempt + 1) + '/5), waiting...');
-        await page.waitForTimeout(3000);
-        continue;
-      }
-
-      // Button is enabled — click it!
-      await submitBtn.click();
-      console.log('[Scraper] "Continue to book" clicked');
-      btnClicked = true;
-      break;
+    // Check if we need to login
+    let currentUrl = page.url();
+    let bookingFormVisible = await page.locator('#mc-input-origin, mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible({ timeout: 15000 }).catch(() => false);
+    
+    // Check for "Access Denied" or Akamai challenge
+    const pageTitle = await page.title().catch(() => '');
+    const pageText = await page.evaluate(() => document.body.innerText.substring(0, 1000)).catch(() => '');
+    
+    if (pageTitle.includes('Access Denied') || pageText.includes('Access Denied') || pageText.includes('you don\'t have permission')) {
+      const html = await page.content();
+      snapshotId = saveSnapshot(html, job_id);
+      await context.close();
+      return {
+        status: 'FAILED',
+        error: 'Access Denied by Maersk (Bot detection). Try refreshing persistent session.',
+        reason_code: 'ACCESS_DENIED',
+        snapshot_id: snapshotId,
+        candidates: [],
+      };
     }
 
-    if (!btnClicked) {
-      // Try force-clicking even if disabled as a last resort
-      console.log('[Scraper] Force-clicking submit button...');
-      await submitBtn.click({ force: true }).catch(e => {
-        console.log('[Scraper] Force-click failed: ' + e.message.substring(0, 80));
+    if (currentUrl.includes('accounts.maersk.com') || !bookingFormVisible) {
+      console.log('[Scraper] Login required or booking form not yet visible. Current URL: ' + currentUrl);
+      
+      // Additional check: maybe we are on a login page that isn't accounts.maersk.com (rare but possible)
+      const isActuallyLoginPage = await page.evaluate(() => {
+        return document.body.innerText.includes('Sign in to your account') || 
+               document.body.innerText.includes('Welcome to Maersk') ||
+               !!document.querySelector('input[type="password"]');
       });
-    }
 
-    // STEP 9: WAIT FOR RESULTS & SCROLL TO LOAD ALL
-    console.log('[Scraper] Waiting for results...');
-    await page.waitForTimeout(10000);
-    const loader = page.locator('mc-loading-indicator, .loading, [class*="spinner"]');
-    if (await loader.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await loader.waitFor({ state: 'hidden', timeout: 30000 }).catch(() => { });
-      await page.waitForTimeout(2000);
-    }
+      if (isActuallyLoginPage && !currentUrl.includes('accounts.maersk.com')) {
+        console.log('[Scraper] Detected login elements on current page.');
+      }
 
-    // Scroll down to load ALL result cards (Maersk may lazy-load)
-    let prevCardCount = 0;
-    for (let scrollAttempt = 0; scrollAttempt < 8; scrollAttempt++) {
-      const cardCount = await page.locator(
-        'mc-card, .schedule-card, .offer-card, .rate-card, [data-test*="schedule"], [data-test*="result"], [data-test*="offer"]'
-      ).count().catch(() => 0);
-      console.log('[Scraper] Scroll #' + (scrollAttempt + 1) + ': ' + cardCount + ' cards visible');
-      if (cardCount > 0 && cardCount === prevCardCount) break; // no new cards loaded
-      prevCardCount = cardCount;
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(2000);
-      // Check for "Show more" or "Load more" buttons
-      const moreBtn = page.locator('button:has-text("Show more"), button:has-text("Load more"), a:has-text("Show more")').first();
-      if (await moreBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-        await moreBtn.click();
-        console.log('[Scraper] Clicked "Show more" button');
+      // If we are on the homepage or a landing page, try to find a "Book" link
+      if (!currentUrl.includes('book') && !currentUrl.includes('accounts') && !isActuallyLoginPage) {
+        console.log('[Scraper] Not on booking page, trying to navigate to /book/ again...');
+        await page.goto(BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await page.waitForTimeout(5000);
+        currentUrl = page.url();
+        bookingFormVisible = await page.locator('mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible({ timeout: 5000 }).catch(() => false);
+      }
+
+      // Check for a login/sign-in button that might need to be clicked
+
+      // If we are on the booking page but the component isn't visible yet, wait a bit more
+      if (currentUrl.includes('maersk.com/book') && !bookingFormVisible) {
+        console.log('[Scraper] On booking page, waiting for O/D component to initialize...');
+        await page.waitForTimeout(5000);
+        const secondCheck = await page.locator('mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible({ timeout: 5000 }).catch(() => false);
+        if (secondCheck) {
+          console.log('[Scraper] O/D component finally visible.');
+          // Continue to filling form
+        } else {
+           // still not visible, maybe login is actually required
+           console.log('[Scraper] O/D component still not visible, assuming login required.');
+        }
+      }
+
+      if (currentUrl.includes('accounts.maersk.com') || !(await page.locator('mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible().catch(() => false))) {
+        console.log('[Scraper] Performing automatic login...');
+        
+        // Wait for login page to load
         await page.waitForTimeout(3000);
+        
+        // Dismiss any overlays
+        await page.evaluate(() => {
+          const overlay = document.getElementById('coiOverlay');
+          if (overlay) overlay.remove();
+          const wrapper = document.getElementById('cookie-information-template-wrapper');
+          if (wrapper) wrapper.remove();
+        }).catch(() => {});
+        
+        // Check if username input is visible - try multiple selectors
+        const usernameSelectors = [
+          '#mc-input-username',
+          'input[name="username"]',
+          'input[id*="username"]',
+          'mc-input[id*="username"] input',
+          '#username'
+        ];
+        
+        let usernameInput = null;
+        let usernameVisible = false;
+        
+        for (const selector of usernameSelectors) {
+          const el = page.locator(selector).first();
+          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+            usernameInput = el;
+            usernameVisible = true;
+            console.log(`[Scraper] Found username input with selector: ${selector}`);
+            break;
+          }
+        }
+        
+        if (usernameVisible) {
+          console.log(`[Scraper] Filling login credentials (user: ${MAERSK_USERNAME})...`);
+          
+          // Fill username
+          await usernameInput.click();
+          await usernameInput.fill(MAERSK_USERNAME);
+          await page.waitForTimeout(500);
+          
+          // Fill password
+          const passwordInput = page.locator('input[name="password"]:visible, input[type="password"]:visible, #mc-input-password').first();
+          if (await passwordInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await passwordInput.click();
+            await passwordInput.fill(MAERSK_PASSWORD);
+            await page.waitForTimeout(500);
+          } else {
+            throw new Error('Password input not found on login page');
+          }
+          
+          // Click submit button
+          console.log('[Scraper] Submitting login form...');
+          const loginBtn = page.locator('button[type="submit"]').first();
+          await loginBtn.click();
+          
+          // Wait for redirect to booking page
+          console.log('[Scraper] Waiting for login redirect...');
+          await page.waitForTimeout(10000);
+          
+          // Check if we reached the booking page
+          let loginSuccess = false;
+          for (let i = 0; i < 6; i++) { // Wait up to 30 seconds
+            const currentUrl = page.url();
+            console.log(`[Scraper] Login check ${i+1}/6 - URL: ${currentUrl.substring(0, 80)}`);
+            
+            if (currentUrl.includes('maersk.com/book') && !currentUrl.includes('accounts.maersk.com')) {
+              const originVisible = await page.locator('#mc-input-origin, mc-c-origin-destination').first().isVisible({ timeout: 5000 }).catch(() => false);
+              if (originVisible) {
+                loginSuccess = true;
+                console.log('[Scraper] Login successful! Booking form visible.');
+                break;
+              }
+            }
+            await page.waitForTimeout(5000);
+          }
+          
+          if (!loginSuccess) {
+            const html = await page.content();
+            snapshotId = saveSnapshot(html, job_id);
+            await context.close();
+            return {
+              status: 'FAILED',
+              error: 'Login failed or timed out. Check credentials.',
+              reason_code: 'LOGIN_FAILED',
+              snapshot_id: snapshotId,
+              candidates: [],
+            };
+          }
+        } else {
+          // Not on login page but also no booking form - unknown state
+          const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => 'No text');
+          const currentUrl = page.url();
+          const html = await page.content();
+          snapshotId = saveSnapshot(html, job_id);
+          await context.close();
+          return {
+            status: 'FAILED',
+            error: `Unknown page state. URL: ${currentUrl}. Snippet: ${bodyText.replace(/\n/g, ' ')}`,
+            reason_code: 'UNKNOWN_STATE',
+            snapshot_id: snapshotId,
+            candidates: [],
+          };
+        }
       }
     }
-    await screenshot(page, '08_results');
 
-    // STEP 10: EXTRACT RESULTS
-    // Use page.content() for snapshot (outer HTML) but use Playwright's innerText/locators
-    // for actual data extraction since Maersk uses Shadow DOM web components
-    const html = await page.content();
-    const snapshotId = saveSnapshot(html, jobId);
+    console.log('[Scraper] Session valid. Filling booking form...');
 
-    // Also get the full visible text (Playwright's innerText pierces shadow DOM)
-    const fullPageText = await page.locator('body').innerText({ timeout: 10000 }).catch(() => '');
-    console.log('[Scraper] Full page text length: ' + fullPageText.length);
-    console.log('[Scraper] Page text preview: ' + fullPageText.substring(0, 500).replace(/\n/g, ' | '));
+    // Take screenshot before filling
+    await page.screenshot({ path: path.join(SNAPSHOT_DIR, `debug_before_fill_${job_id}.png`) }).catch(() => {});
 
-    const domResults = await page.evaluate(() => {
-      const rates = [];
-      const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+    // Fill Origin using keyboard simulation (triggers web component events properly)
+    await fillMaerskInput(page, '#mc-input-origin', from_port, 'Origin');
+    await selectDropdownOption(page, from_port, 'Origin');
+    
+    // Take screenshot after origin
+    await page.screenshot({ path: path.join(SNAPSHOT_DIR, `debug_after_origin_${job_id}.png`) }).catch(() => {});
+    
+    // Verify origin was selected - check the displayed text
+    const originValue = await page.inputValue('#mc-input-origin').catch(() => 
+      page.$eval('#mc-input-origin', el => el.value).catch(() => '')
+    );
+    console.log(`[Scraper] Origin value after selection: "${originValue}"`);
+    
+    // Check if origin is properly selected (should contain the port name)
+    if (!originValue || !originValue.toLowerCase().includes(from_port.toLowerCase().substring(0, 4))) {
+      console.log(`[Scraper] WARNING: Origin may not be properly selected`);
+    }
+    
+    await page.waitForTimeout(1000);
 
-      function extractDate(text) {
-        // Match patterns like "04 MAR", "4 Mar 2026", "Mar 04", "2026-03-04"
-        let dm = text.match(/(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(?:\w*)\s*(\d{4})?/i);
-        if (dm) {
-          const day = parseInt(dm[1]);
-          const mon = dm[2].toUpperCase().substring(0, 3);
-          const year = dm[3] ? parseInt(dm[3]) : new Date().getFullYear();
-          const mi = MONTHS.indexOf(mon);
-          if (mi >= 0) return year + '-' + String(mi + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
-        }
-        // Try "Mar 04, 2026" or "Mar 4"
-        dm = text.match(/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(?:\w*)\s+(\d{1,2})(?:[,\s]+(\d{4}))?/i);
-        if (dm) {
-          const day = parseInt(dm[2]);
-          const mon = dm[1].toUpperCase().substring(0, 3);
-          const year = dm[3] ? parseInt(dm[3]) : new Date().getFullYear();
-          const mi = MONTHS.indexOf(mon);
-          if (mi >= 0) return year + '-' + String(mi + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
-        }
-        // ISO format
-        dm = text.match(/(\d{4})-(\d{2})-(\d{2})/);
-        if (dm) return dm[0];
-        return null;
-      }
+    // Fill Destination
+    await fillMaerskInput(page, '#mc-input-destination', to_port, 'Destination');
+    await selectDropdownOption(page, to_port, 'Destination');
+    
+    // Take screenshot after destination
+    await page.screenshot({ path: path.join(SNAPSHOT_DIR, `debug_after_dest_${job_id}.png`) }).catch(() => {});
+    
+    // Verify destination was selected
+    const destValue = await page.inputValue('#mc-input-destination').catch(() =>
+      page.$eval('#mc-input-destination', el => el.value).catch(() => '')
+    );
+    console.log(`[Scraper] Destination value after selection: "${destValue}"`);
+    
+    // Check if destination is properly selected
+    if (!destValue || !destValue.toLowerCase().includes(to_port.toLowerCase().substring(0, 4))) {
+      console.log(`[Scraper] WARNING: Destination may not be properly selected`);
+    }
+    
+    await page.waitForTimeout(1000);
 
-      // Helper: recursively get text from element including shadow DOM
-      function getDeepText(el) {
-        let text = '';
-        if (el.shadowRoot) {
-          for (const child of el.shadowRoot.childNodes) {
-            text += getDeepText(child);
-          }
-        }
-        for (const child of el.childNodes) {
-          if (child.nodeType === Node.TEXT_NODE) {
-            text += child.textContent;
-          } else if (child.nodeType === Node.ELEMENT_NODE) {
-            text += getDeepText(child);
-          }
-        }
-        return text;
-      }
-
-      // Try multiple selectors for result cards
-      const cardSelectors = [
-        'mc-card, .schedule-card, .offer-card, .rate-card',
-        '[data-test*="schedule"], [data-test*="result"], [data-test*="offer"]',
-        '[data-test*="sailing"], [data-test*="price"]',
-        '.booking-result, .sailing-result, .price-card',
+    // Check if submit button is already enabled after O/D selection
+    const submitBtnCheck = page.locator('[data-test="buttonSubmit"], mc-button[data-test="buttonSubmit"]').first();
+    const isDisabledAfterOD = await submitBtnCheck.getAttribute('disabled');
+    const isActuallyDisabledAfterOD = isDisabledAfterOD !== null && isDisabledAfterOD !== 'false';
+    console.log(`[Scraper] Submit button disabled after O/D fill: ${isActuallyDisabledAfterOD}`);
+    
+    // Date selection - now treated as optional if form is already valid
+    if (!ship_date && !isActuallyDisabledAfterOD) {
+      console.log('[Scraper] Date is optional and form is already valid. Skipping date selection.');
+    } else {
+      console.log(`[Scraper] Handling departure date (requested: ${ship_date || 'default'})...`);
+      
+      let datePickerOpened = false;
+      const datePickerSelectors = [
+        'mc-date-picker',
+        '[data-test="mds-date-picker"]',
+        '[data-test="edDatePickerTest"]',
+        '.mds-edd-date-picker',
+        'input[name="earliestDepartureDatePicker"]',
       ];
-
-      for (const sel of cardSelectors) {
-        document.querySelectorAll(sel).forEach(card => {
-          // Use deep text to pierce shadow DOM
-          const text = getDeepText(card) || card.textContent || '';
-          const pm = text.match(/(USD|EUR|GBP|INR|SGD)\s*[\$\u20AC\u00A3]?\s*([\d,]+(?:\.\d{2})?)/i) ||
-            text.match(/([\d,]+(?:\.\d{2})?)\s*(USD|EUR|GBP|INR|SGD)/i);
-          const tm = text.match(/(\d+)\s*(?:days?|transit)/i);
-          const departureDate = extractDate(text);
-          if (pm) {
-            const currency = pm[1].length === 3 ? pm[1].toUpperCase() : pm[2].toUpperCase();
-            const price = parseFloat((pm[1].length === 3 ? pm[2] : pm[1]).replace(/,/g, ''));
-            if (price > 50 && price < 50000) {
-              rates.push({
-                price, currency, transit_days: tm ? parseInt(tm[1]) : null,
-                departure_date: departureDate,
-                extraction_method: 'DOM_SELECTOR', raw_text: text.substring(0, 500)
-              });
+      
+      for (const selector of datePickerSelectors) {
+        const picker = page.locator(selector).first();
+        if (await picker.isVisible({ timeout: 1500 }).catch(() => false)) {
+          console.log(`[Scraper] Opening date picker: ${selector}`);
+          await picker.click({ force: true });
+          datePickerOpened = true;
+          await page.waitForTimeout(1500);
+          break;
+        }
+      }
+      
+      if (datePickerOpened) {
+        const calendar = page.locator('[role="dialog"], [role="grid"], .mds-calendar, .mc-calendar').first();
+        if (await calendar.isVisible({ timeout: 3000 }).catch(() => false)) {
+          let dateSelected = false;
+          if (ship_date) {
+            try {
+              const dayToFind = new Date(ship_date).getDate().toString();
+              const dayCell = calendar.locator(`[role="gridcell"]:not([aria-disabled="true"]):text-is("${dayToFind}"), button:not([disabled]):text-is("${dayToFind}")`).first();
+              if (await dayCell.isVisible({ timeout: 1500 }).catch(() => false)) {
+                await dayCell.click();
+                console.log(`[Scraper] Selected requested day: ${dayToFind}`);
+                dateSelected = true;
+              }
+            } catch (e) { /* ignore */ }
+          }
+          
+          if (!dateSelected) {
+            const firstAvailable = calendar.locator('[role="gridcell"]:not([aria-disabled="true"]), button:not([disabled])').first();
+            if (await firstAvailable.isVisible({ timeout: 1500 }).catch(() => false)) {
+              await firstAvailable.click();
+              console.log('[Scraper] Selected first available date');
             }
           }
-        });
+          await page.waitForTimeout(1000);
+        }
+      } else {
+        // Fallback: "Select tomorrow" link
+        const tomorrowLink = page.locator('a.select-tomorrow-link:not(.mds-link--disabled), text=Select tomorrow').first();
+        if (await tomorrowLink.isVisible({ timeout: 1500 }).catch(() => false)) {
+          console.log('[Scraper] Clicking "Select tomorrow" link...');
+          await tomorrowLink.click({ force: true });
+          await page.waitForTimeout(1500);
+        }
       }
+    }
+    
+    // Take screenshot after date handling
+    await page.screenshot({ path: path.join(SNAPSHOT_DIR, `debug_after_date_${job_id}.png`) }).catch(() => {});
+    
+    // Verify current date value
+    const dateInput = page.locator('input[name="earliestDepartureDatePicker"], [data-test="earliestDepartureDate"] input, mc-date-picker input').first();
+    const finalDateStr = await dateInput.getAttribute('value').catch(() => 
+      page.evaluate(() => {
+        const input = document.querySelector('input[name="earliestDepartureDatePicker"]');
+        return input ? input.value : 'not set';
+      })
+    );
+    console.log(`[Scraper] Departure date status: ${finalDateStr}`);
+    
+    await page.waitForTimeout(1000);
 
-      // Fallback: regex on full page innerText (this catches shadow DOM content too)
-      if (!rates.length) {
-        const fullText = document.body.innerText || '';
-        // Look for price patterns with context
-        const rx = /(USD|EUR|GBP|INR|SGD)\s*([\d,]+(?:\.\d{2})?)/gi;
-        let m;
-        while ((m = rx.exec(fullText)) !== null) {
-          const p = parseFloat(m[2].replace(/,/g, ''));
-          // Get surrounding text (100 chars before and after) for date/transit extraction
-          const start = Math.max(0, m.index - 200);
-          const end = Math.min(fullText.length, m.index + m[0].length + 200);
-          const context = fullText.substring(start, end);
-          const tm = context.match(/(\d+)\s*(?:days?|transit)/i);
-          const departureDate = extractDate(context);
-          if (p > 50 && p < 50000) {
-            rates.push({
-              price: p, currency: m[1].toUpperCase(),
-              transit_days: tm ? parseInt(tm[1]) : null,
-              departure_date: departureDate,
-              extraction_method: 'REGEX_FALLBACK'
-            });
+    // Handle container type selection
+    if (container_type && CONTAINER_MAP[container_type]) {
+      console.log(`[Scraper] Setting container type: ${container_type}`);
+      
+      const containerSelectors = [
+        '[data-test*="container"]',
+        '[data-test*="equipment"]',
+        'select[name*="container"]',
+        'mc-select[data-test*="container"]',
+        '.mc-select',
+      ];
+      
+      for (const selector of containerSelectors) {
+        const containerSelect = page.locator(selector).first();
+        if (await containerSelect.isVisible({ timeout: 2000 }).catch(() => false)) {
+          try {
+            await containerSelect.click();
+            await page.waitForTimeout(800);
+            
+            const optionLabel = CONTAINER_MAP[container_type];
+            const option = page.locator(`[role="option"]:has-text("${optionLabel}"), option:has-text("${optionLabel}"), .mc-select__option:has-text("${optionLabel}")`).first();
+            
+            if (await option.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await option.click();
+              console.log(`[Scraper] Selected container type: ${optionLabel}`);
+              await page.waitForTimeout(1000);
+              break;
+            } else {
+              // Try selectOption for native select
+              await containerSelect.selectOption({ label: optionLabel }).catch(() => {});
+            }
+          } catch (e) {
+            console.log(`[Scraper] Container selection error: ${e.message}`);
           }
         }
       }
-      return rates;
-    });
-    console.log('[Scraper] DOM extracted ' + domResults.length + ' results');
-    domResults.forEach((r, i) => console.log('[Scraper]   #' + (i + 1) + ': ' + r.currency + ' ' + r.price + (r.departure_date ? ' dep=' + r.departure_date : '') + (r.transit_days ? ' transit=' + r.transit_days + 'd' : '')));
-
-    const apiExtracted = extractFromApiResponses(apiResponses);
-    console.log('[Scraper] API extracted ' + apiExtracted.length + ' results');
-    // Merge both sources — prefer API data but include DOM results too
-    let results = apiExtracted.length > 0 ? apiExtracted : domResults;
-    // Deduplicate by price+currency+date (not just price+currency+transit)
-    const seen = new Set();
-    results = results.filter(r => {
-      const k = r.price + '-' + r.currency + '-' + (r.departure_date || '') + '-' + (r.transit_days || '');
-      if (seen.has(k)) return false; seen.add(k); return true;
-    });
-    console.log('[Scraper] Final unique results: ' + results.length);
-
-    await context.close(); context = null;
-    const elapsed = Date.now() - startTime;
-    console.log('[Scraper] === Done: ' + results.length + ' results in ' + elapsed + 'ms ===\n');
-
-    if (!results.length) {
-      return { job_id: jobId, status: 'NO_RESULTS', snapshot_id: snapshotId, elapsed_ms: elapsed, candidates: [], message: 'No pricing data found.' };
     }
 
-    const candidates = results.map(r => ({
-      ...r, confidence_score: confidence(r), snapshot_id: snapshotId, valid_until: validUntil(),
-      departure_date: r.departure_date || null,
-      service_type: r.service_type || 'Spot', ocean_freight: r.ocean_freight || r.price,
-      origin_thc: r.origin_thc || 0, destination_thc: r.destination_thc || 0, total_price: r.total_price || r.price,
-    }));
-    console.log('[Scraper] Returning ' + candidates.length + ' candidates');
-    candidates.forEach((c, i) => console.log('[Scraper]   Candidate #' + (i + 1) + ': ' + c.currency + ' ' + c.price + (c.departure_date ? ' dep=' + c.departure_date : '')));
+    // Final checks before submission
+    await page.waitForTimeout(2000); // Wait for form to settle
 
-    return { job_id: jobId, status: 'SUCCESS', snapshot_id: snapshotId, elapsed_ms: elapsed, candidates, simulated: false };
+    // Try to catch "Something went wrong" banner if it already appeared
+    const errorMsgOnForm = await page.locator('.mc-banner--error, .mc-c-error-message, [data-test*="error"]').first().textContent().catch(() => null);
+    if (errorMsgOnForm && errorMsgOnForm.trim().length > 0) {
+      console.log(`[Scraper] WARNING: Website already showing error: "${errorMsgOnForm.trim()}"`);
+    }
+
+    // Take screenshot before submit
+    await page.screenshot({ path: path.join(SNAPSHOT_DIR, `debug_before_submit_${job_id}.png`) }).catch(() => {});
+
+    // Check form state
+    const formState = await page.evaluate(() => {
+      const origin = document.querySelector('#mc-input-origin');
+      const dest = document.querySelector('#mc-input-destination');
+      return {
+        originValue: origin ? origin.value : 'NOT_FOUND',
+        destValue: dest ? dest.value : 'NOT_FOUND',
+        originFilled: origin && origin.value.length > 0,
+        destFilled: dest && dest.value.length > 0,
+      };
+    });
+    console.log('[Scraper] Form state:', JSON.stringify(formState));
+
+    // Submit the form
+    console.log('[Scraper] Submitting booking search...');
+    
+    const submitSelectors = [
+      '[data-test="buttonSubmit"]',
+      'mc-button[data-test="buttonSubmit"]',
+      'button[type="submit"]',
+      'button:has-text("Search")',
+      'mc-button:has-text("Search")',
+    ];
+    
+    let submitBtn = null;
+    for (const selector of submitSelectors) {
+      const btn = page.locator(selector).first();
+      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        submitBtn = btn;
+        console.log(`[Scraper] Found submit button with selector: ${selector}`);
+        break;
+      }
+    }
+    
+    if (!submitBtn) {
+      const html = await page.content();
+      snapshotId = saveSnapshot(html, job_id);
+      await context.close();
+      return {
+        status: 'FAILED',
+        error: 'Submit button not found on page',
+        reason_code: 'FORM_ERROR',
+        snapshot_id: snapshotId,
+        candidates: [],
+      };
+    }
+
+    // Check if button is enabled
+    // Note: mc-button might use an 'is-disabled' attribute or similar instead of native 'disabled'
+    const isDisabled = await submitBtn.getAttribute('disabled');
+    const isActuallyDisabled = isDisabled !== null && isDisabled !== 'false';
+    
+    if (isActuallyDisabled) {
+      console.log('[Scraper] Submit button is DISABLED - form may be incomplete. Attempting to wait...');
+      await page.waitForTimeout(3000);
+      if (await submitBtn.getAttribute('disabled') !== null) {
+        const html = await page.content();
+        snapshotId = saveSnapshot(html, job_id);
+        await context.close();
+        return {
+          status: 'FAILED',
+          error: 'Submit button is disabled. Check if O/D and Date are properly selected.',
+          reason_code: 'FORM_INCOMPLETE',
+          snapshot_id: snapshotId,
+          candidates: [],
+        };
+      }
+    }
+
+    await submitBtn.click({ force: true });
+
+    // Wait for results page or error
+    console.log('[Scraper] Waiting for results or error banner...');
+    
+    // Set a race between price results and error messages
+    const waitResult = await Promise.race([
+      // Price card appears
+      page.locator('[data-test*="price"], .price, [class*="price"], [class*="rate"], .mc-card').first()
+        .waitFor({ state: 'visible', timeout: 35000 }).then(() => 'SUCCESS'),
+        
+      // Error banner appears
+      page.locator('.mc-banner--error, .mc-c-error-message, [data-test*="error"], :text("Something went wrong")').first()
+        .waitFor({ state: 'visible', timeout: 35000 }).then(() => 'ERROR'),
+        
+      // No routes message
+      page.locator(':text("no results"), :text("No routes"), :text("not available")').first()
+        .waitFor({ state: 'visible', timeout: 35000 }).then(() => 'NO_RESULTS'),
+    ]).catch(() => 'TIMEOUT');
+
+    console.log(`[Scraper] Navigation/Wait outcome: ${waitResult}`);
+
+    // Save snapshot
+    const html = await page.content();
+    snapshotId = saveSnapshot(html, job_id);
+
+    if (waitResult !== 'SUCCESS') {
+      // Check for specific error messages
+      const errorMsg = await page.locator('.mc-banner--error, .mc-c-error-message, [data-test*="error"]').first().textContent().catch(() => null);
+      const isSomethingWentWrong = html.includes('Something went wrong') || (errorMsg && errorMsg.includes('Something went wrong'));
+      
+      await context.close();
+
+      if (waitResult === 'NO_RESULTS' || html.includes('No routes available')) {
+        return {
+          status: 'FAILED',
+          error: 'No routes available for this origin-destination pair.',
+          reason_code: 'NO_ROUTES',
+          snapshot_id: snapshotId,
+          candidates: [],
+        };
+      }
+
+      const finalError = errorMsg ? errorMsg.trim() : (isSomethingWentWrong ? 'Website reported: Something went wrong.' : 'Failed to load pricing results within timeout.');
+      
+      return {
+        status: 'FAILED',
+        error: finalError,
+        reason_code: isSomethingWentWrong ? 'WEBSITE_ERROR' : 'TIMEOUT',
+        snapshot_id: snapshotId,
+        candidates: [],
+      };
+    }
+
+    // Extract pricing data from the page
+    console.log('[Scraper] Extracting pricing data...');
+    const candidates = await extractPricingCandidates(page, snapshotId);
+
+    await context.close();
+
+    if (candidates.length === 0) {
+      return {
+        status: 'FAILED',
+        error: 'Could not extract pricing data from results page.',
+        reason_code: 'PARSE_ERROR',
+        snapshot_id: snapshotId,
+        candidates: [],
+      };
+    }
+
+    console.log(`[Scraper] Found ${candidates.length} pricing candidate(s)`);
+    return {
+      status: 'SUCCESS',
+      source: 'MAERSK_LIVE',
+      snapshot_id: snapshotId,
+      candidates,
+    };
 
   } catch (err) {
-    if (context) await context.close().catch(() => { });
-    console.error('[Scraper] === FAILED: ' + err.message + ' ===\n');
+    console.error('[Scraper] Error:', err.message);
+    
+    if (context) {
+      try {
+        const page = context.pages()[0];
+        if (page) {
+          const html = await page.content().catch(() => '');
+          if (html) {
+            snapshotId = saveSnapshot(html, job_id);
+          }
+        }
+        await context.close();
+      } catch { /* ignore */ }
+    }
+
     return {
-      job_id: jobId, status: 'FAILED', error: err.message, elapsed_ms: Date.now() - startTime,
-      reason_code: /rate.?limit/i.test(err.message) ? 'RATE_LIMITED' :
-        /captcha|blocked|forbidden/i.test(err.message) ? 'ANTI_BOT_DETECTED' : 'SCRAPER_ERROR',
+      status: 'FAILED',
+      error: err.message,
+      reason_code: 'SCRAPER_ERROR',
+      snapshot_id: snapshotId,
       candidates: [],
     };
   }
 }
 
-function extractFromApiResponses(responses) {
-  const rates = [];
-  for (const { body } of responses) {
-    try {
-      if (!body) continue;
-      const items = Array.isArray(body) ? body : body.schedules || body.offers || body.results || body.data || [];
-      if (Array.isArray(items)) {
-        items.forEach(item => {
-          const price = item.price || item.totalPrice || item.amount || item.rate;
-          const currency = item.currency || item.currencyCode || 'USD';
-          // Extract departure date from various API field names
-          const depDate = item.departureDate || item.departure_date || item.sailingDate ||
-            item.etd || item.departureDateTime || item.departureDateLocal || null;
-          // Normalize date to YYYY-MM-DD
-          let normalizedDate = null;
-          if (depDate) {
-            try {
-              const d = new Date(depDate);
-              if (!isNaN(d.getTime())) normalizedDate = d.toISOString().split('T')[0];
-            } catch { }
-          }
-          if (price && typeof price === 'number' && price > 50) {
-            rates.push({
-              price, currency: currency.toUpperCase(), transit_days: item.transitDays || item.transit_days || null,
-              departure_date: normalizedDate,
-              service_type: item.serviceType || item.service_type || 'Spot', extraction_method: 'API_INTERCEPT',
-              ocean_freight: item.oceanFreight || item.ocean_freight || price,
-              origin_thc: item.originThc || item.origin_thc || 0,
-              destination_thc: item.destinationThc || item.destination_thc || 0,
-              total_price: item.totalPrice || item.total_price || price,
-            });
-          }
+/**
+ * Extract pricing candidates from the results page
+ */
+async function extractPricingCandidates(page, snapshotId) {
+  const candidates = [];
+
+  try {
+    // Try multiple selector strategies to find price cards
+    const priceCards = await page.locator('[data-test*="card"], .mc-card, [class*="quote"], [class*="result"]').all();
+
+    if (priceCards.length === 0) {
+      // Fallback: try to extract from page text
+      const pageText = await page.evaluate(() => document.body.innerText);
+      const priceMatch = pageText.match(/USD\s*([\d,]+)/i) || pageText.match(/([\d,]+)\s*USD/i);
+      const transitMatch = pageText.match(/(\d+)\s*days?/i);
+
+      if (priceMatch) {
+        candidates.push({
+          price: parseFloat(priceMatch[1].replace(/,/g, '')),
+          total_price: parseFloat(priceMatch[1].replace(/,/g, '')),
+          currency: 'USD',
+          transit_days: transitMatch ? parseInt(transitMatch[1], 10) : null,
+          service_type: 'STANDARD',
+          carrier: 'Maersk',
+          valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          confidence_score: 0.6, // Lower confidence for text extraction
+          snapshot_id: snapshotId,
         });
       }
-    } catch { }
+    } else {
+      // Extract from each price card
+      for (const card of priceCards.slice(0, 5)) { // Limit to top 5 results
+        try {
+          const cardText = await card.textContent();
+          
+          // Extract price
+          const priceMatch = cardText.match(/USD\s*([\d,]+)/i) || cardText.match(/([\d,]+)\s*USD/i);
+          if (!priceMatch) continue;
+
+          const price = parseFloat(priceMatch[1].replace(/,/g, ''));
+          if (isNaN(price) || price <= 0) continue;
+
+          // Extract transit days
+          const transitMatch = cardText.match(/(\d+)\s*days?/i);
+          const transitDays = transitMatch ? parseInt(transitMatch[1], 10) : null;
+
+          // Extract service type
+          let serviceType = 'STANDARD';
+          if (cardText.toLowerCase().includes('express')) serviceType = 'EXPRESS';
+          else if (cardText.toLowerCase().includes('economy')) serviceType = 'ECONOMY';
+
+          // Try to extract component prices
+          const oceanMatch = cardText.match(/ocean[^\d]*([\d,]+)/i);
+          const thcMatch = cardText.match(/thc[^\d]*([\d,]+)/i);
+
+          candidates.push({
+            price: price,
+            total_price: price,
+            ocean_freight: oceanMatch ? parseFloat(oceanMatch[1].replace(/,/g, '')) : null,
+            origin_thc: thcMatch ? parseFloat(thcMatch[1].replace(/,/g, '')) / 2 : null,
+            destination_thc: thcMatch ? parseFloat(thcMatch[1].replace(/,/g, '')) / 2 : null,
+            currency: 'USD',
+            transit_days: transitDays,
+            service_type: serviceType,
+            carrier: 'Maersk',
+            valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            confidence_score: 0.75,
+            snapshot_id: snapshotId,
+          });
+        } catch (cardErr) {
+          console.warn('[Scraper] Failed to parse price card:', cardErr.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Scraper] Extract error:', err.message);
   }
-  return rates;
+
+  // Sort by price ascending
+  candidates.sort((a, b) => a.price - b.price);
+
+  return candidates;
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// SIMULATED SCRAPER
-// ══════════════════════════════════════════════════════════════════════════
-
-function simulateScrape(params) {
-  const jobId = params.job_id || uuidv4();
-  const basePrices = {
-    'SINGAPORE-TUTICORIN': { price: 680, transit: 7 }, 'SINGAPORE-CHENNAI': { price: 640, transit: 5 },
-    'SHANGHAI-NHAVA SHEVA': { price: 880, transit: 16 }, 'SINGAPORE-JEBEL ALI': { price: 520, transit: 6 },
-    'SHANGHAI-ISTANBUL': { price: 1450, transit: 25 }, 'SINGAPORE-MERSIN': { price: 1250, transit: 20 },
-    'SHANGHAI-CHENNAI': { price: 780, transit: 14 }, 'SINGAPORE-NHAVA SHEVA': { price: 560, transit: 8 },
-    'SHANGHAI-TUTICORIN': { price: 820, transit: 15 }, 'SINGAPORE-ISTANBUL': { price: 1350, transit: 22 },
-    'SHANGHAI-MERSIN': { price: 1380, transit: 24 }, 'SINGAPORE-LAGOS': { price: 1680, transit: 28 },
-    'SHANGHAI-LAGOS': { price: 1920, transit: 32 }, 'SHANGHAI-JEBEL ALI': { price: 720, transit: 12 },
-  };
-  const key = params.from_port.toUpperCase() + '-' + params.to_port.toUpperCase();
-  const base = basePrices[key] || { price: 500 + Math.floor(Math.random() * 2000), transit: 7 + Math.floor(Math.random() * 30) };
-  const price = Math.round(base.price * (0.9 + Math.random() * 0.2));
-  const originThc = Math.round(80 + Math.random() * 60);
-  const destThc = Math.round(40 + Math.random() * 50);
-  const candidates = [{
-    price, currency: 'USD', transit_days: base.transit, service_type: 'Maersk Spot - Direct',
-    valid_until: validUntil(), confidence_score: Math.round((0.85 + Math.random() * 0.15) * 100) / 100,
-    extraction_method: 'SIMULATED', snapshot_id: 'snap_sim_' + uuidv4().slice(0, 8),
-    ocean_freight: price, origin_thc: originThc,
-    destination_thc: destThc, total_price: price + originThc + destThc,
-  }];
-  return {
-    job_id: jobId, status: 'SUCCESS', snapshot_id: candidates[0].snapshot_id,
-    elapsed_ms: 1200 + Math.floor(Math.random() * 3000), candidates, simulated: true,
-  };
-}
-
-module.exports = { scrapeMaerskSpotRate, simulateScrape, saveSnapshot, calculateConfidence: confidence };
+module.exports = {
+  simulateScrape,
+  scrapeMaerskSpotRate,
+};

@@ -10,7 +10,7 @@ async function run() {
     const buf = fs.readFileSync(DB_PATH);
     const db = new SQL.Database(buf);
 
-    const res = db.exec("SELECT result_json FROM scrape_jobs WHERE to_port LIKE '%MUNDRA%' AND status = 'SUCCESS' ORDER BY updated_at DESC LIMIT 1");
+    const res = db.exec("SELECT result_json FROM scrape_jobs WHERE to_port LIKE '%MUNDRA (GUJARAT)%' AND status = 'SUCCESS' ORDER BY updated_at DESC LIMIT 1");
     if (res.length > 0) {
         console.log(res[0].values[0][0]);
     } else {

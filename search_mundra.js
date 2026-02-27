@@ -10,7 +10,7 @@ async function run() {
     const buf = fs.readFileSync(DB_PATH);
     const db = new SQL.Database(buf);
 
-    const res = db.exec("SELECT * FROM port_aliases WHERE alias LIKE '%MUNDRA%' OR un_locode = 'INMUN'");
+    const res = db.exec("SELECT * FROM port_aliases WHERE alias LIKE '%MUNDRA (GUJARAT)%' OR un_locode = 'INMUN'");
     console.log(JSON.stringify(res, null, 2));
 }
 

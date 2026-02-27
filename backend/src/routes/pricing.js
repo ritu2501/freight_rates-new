@@ -49,6 +49,10 @@ router.get('/ports', (req, res) => {
   }
 
   if (type === 'pod') {
+    // Return union of pricing lanes and known port aliases for the country.
+    const portsSet = new Set();
+
+    // 1) add distinct to_port from pricing (filtered by country if provided)
     let sql = `SELECT DISTINCT to_port AS port FROM pricing`;
     const params = [];
     if (country) {
@@ -57,7 +61,20 @@ router.get('/ports', (req, res) => {
     }
     sql += ` ORDER BY to_port`;
     const rows = db.prepare(sql).all(...params);
-    return res.json(rows.map((r) => r.port));
+    rows.forEach((r) => portsSet.add(r.port));
+
+    // 2) add aliases from port_aliases for the country
+    try {
+      const aliasRows = country
+        ? db.prepare(`SELECT alias FROM port_aliases WHERE country = ? ORDER BY alias`).all(country)
+        : db.prepare(`SELECT alias FROM port_aliases ORDER BY alias`).all();
+      aliasRows.forEach((r) => portsSet.add(r.alias));
+    } catch (e) {
+      // ignore
+    }
+
+    // Return sorted list
+    return res.json(Array.from(portsSet).filter(Boolean).sort());
   }
 
   // All ports
@@ -212,8 +229,8 @@ router.post('/scrape', async (req, res) => {
       }
 
       if (scrapeResult.status === 'FAILED') {
-        db.prepare(`UPDATE scrape_jobs SET status='FAILED', error_message=?, updated_at=datetime('now') WHERE id=?`)
-          .run(scrapeResult.error || 'Unknown error', jobId);
+        db.prepare(`UPDATE scrape_jobs SET status='FAILED', error_message=?, snapshot_id=?, updated_at=datetime('now') WHERE id=?`)
+          .run(scrapeResult.error || 'Unknown error', scrapeResult.snapshot_id || null, jobId);
 
         try {
           db.prepare(`INSERT INTO failure_records (scrape_job_id, reason_code, details) VALUES (?, ?, ?)`)
