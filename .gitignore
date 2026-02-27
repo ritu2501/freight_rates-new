@@ -6,4 +6,13 @@ build/
 *.sqlite
 snapshots/
 *.log
+<<<<<<< HEAD
 backend/.maersk-profile/
+=======
+.maersk-profile/
+backend/.maersk-profile/
+backend/snapshots/
+backend/recon_snapshots/
+backend/login_lockout.txt
+backend/test_out*.txt
+>>>>>>> ba37e6029fa4bcfb7f5adff70a245975706d96bb
