@@ -114,6 +114,174 @@ function saveSnapshot(html, jobId) {
 }
 
 /**
+ * Capture console messages and important network responses for debugging
+ */
+function captureDebugArtifacts(page, jobId) {
+  try {
+    const outBase = path.join(SNAPSHOT_DIR, `debug_${jobId}`);
+    const logsPath = outBase + '.logs.txt';
+    const netPath = outBase + '.network.jsonl';
+
+    // ensure dir exists
+    try { fs.mkdirSync(path.dirname(outBase), { recursive: true }); } catch (e) {}
+
+    const writeLog = (line) => fs.appendFileSync(logsPath, line + '\n');
+
+    page.on('console', (msg) => {
+      try { writeLog(`[console] ${msg.type()}: ${msg.text()}`); } catch (e) {}
+    });
+
+    page.on('pageerror', (err) => {
+      try { writeLog(`[pageerror] ${err.message}`); } catch (e) {}
+    });
+
+    page.on('response', async (res) => {
+      try {
+        const ct = res.headers()['content-type'] || '';
+        const url = res.url();
+        const status = res.status();
+        // Only capture HTML/JSON and error statuses to limit size
+        if (ct.includes('text/html') || ct.includes('application/json') || status >= 400) {
+          let text = '';
+          try { text = await res.text(); } catch (e) { text = `<error reading body: ${e.message}>`; }
+          const record = { ts: new Date().toISOString(), url, status, content_type: ct, snippet: text.slice(0, 2000) };
+          fs.appendFileSync(netPath, JSON.stringify(record) + '\n');
+        }
+      } catch (e) { /* ignore */ }
+    });
+
+    return { logsPath, netPath };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Wait for a locator to be visible with bounded retries and exponential backoff
+ */
+async function waitForVisibleWithRetries(locator, attempts = 3, baseMs = 800) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (await locator.isVisible({ timeout: baseMs }).catch(() => false)) return true;
+    } catch (e) { /* ignore */ }
+    await new Promise((r) => setTimeout(r, baseMs * Math.pow(2, i)));
+  }
+  return false;
+}
+
+/**
+ * Detect common captcha/anti-bot indicators on the page
+ */
+async function detectCaptcha(page) {
+  try {
+    const text = (await page.evaluate(() => document.body.innerText).catch(() => '')).toLowerCase();
+    const title = (await page.title().catch(() => '')).toLowerCase();
+    const indicators = ['captcha', 'i am not a robot', "i'm not a robot", 'recaptcha', 'hcaptcha', 'are you a human', 'verify you are human'];
+    for (const ind of indicators) {
+      if (text.includes(ind) || title.includes(ind)) return true;
+    }
+    // Also check for known captcha iframe presence
+    const hasIframe = await page.$('iframe[src*="recaptcha"], iframe[src*="hcaptcha"]').catch(() => null);
+    if (hasIframe) return true;
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+
+/**
+ * Detect common consent/cookie overlays that block interaction
+ */
+async function detectConsent(page) {
+  try {
+    const text = (await page.evaluate(() => document.body.innerText).catch(() => '')).toLowerCase();
+    if (text.includes('accept cookies') || text.includes('to use this site') || text.includes('we use cookies') || text.includes('cookie')) return true;
+    // Look for known DOM selectors
+    const selectors = ['.cookie-popup', '.coi-banner__accept', '#accept-cookies', '.mds-cookie-banner__button--accept', '[data-test*="cookie"]', '#coiOverlay', '#cookie-information-template-wrapper'];
+    for (const sel of selectors) {
+      if (await page.$(sel).catch(() => null)) return true;
+    }
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+
+/**
+ * Detect Access Denied / blocked IP pages
+ */
+async function detectAccessDenied(page) {
+  try {
+    const text = (await page.evaluate(() => document.body.innerText).catch(() => '')).toLowerCase();
+    const title = (await page.title().catch(() => '')).toLowerCase();
+    if (text.includes('access denied') || text.includes('your ip') || text.includes('blocked') || text.includes('you don\'t have permission')) return true;
+    if (title.includes('access denied') || title.includes('blocked')) return true;
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+
+/**
+ * Detect portal / SSO login pages or OAuth grant failures
+ */
+async function detectPortalLogin(page) {
+  try {
+    const url = (page.url() || '').toLowerCase();
+    if (url.includes('/portaluser/') || url.includes('/portaluser') || url.includes('/portal-login') || url.includes('portaluser/login')) return true;
+    // Look for forms pointing to accounts.maersk.com or common SSO texts
+    const body = (await page.evaluate(() => document.body.innerText).catch(() => '')).toLowerCase();
+    if (body.includes('portaluser') || body.includes('sign in to your account') || body.includes('sign in with') || body.includes('sign in to maersk')) return true;
+    // Check for SSO / oauth form action targets
+    const hasSsoForm = await page.$('form[action*="accounts.maersk.com"], form[action*="/oauth2/"]') .catch(() => null);
+    if (hasSsoForm) return true;
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+
+/**
+ * Try to click common consent/authorize buttons on SSO pages
+ */
+async function clickConsentButtons(page) {
+  const btnSelectors = [
+    'button:has-text("Allow")',
+    'button:has-text("Authorize")',
+    'button:has-text("Accept")',
+    'button:has-text("Continue")',
+    'button:has-text("Yes")',
+    'button:has-text("Approve")',
+    'button#approve',
+    'input[type="submit"][value*="Allow"]'
+  ];
+
+  for (const sel of btnSelectors) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
+        console.log('[Scraper] Clicking consent button:', sel);
+        await el.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(2000);
+      }
+    } catch (e) { /* ignore */ }
+  }
+}
+
+
+/**
+ * Generic booking form visibility detection used by tests
+ */
+async function isBookingVisible(page) {
+  const selectors = [
+    '#mc-input-origin',
+    'mc-c-origin-destination',
+    '[data-test="mccOriginDestination"]',
+    '#booking-form',
+    'input[name="origin"]',
+    'input[name="destination"]'
+  ];
+  const locator = page.locator(selectors.join(',')).first();
+  return await waitForVisibleWithRetries(locator, 3, 500).catch(() => false);
+}
+
+/**
  * Fill a Maersk web component input field with proper event dispatching
  * This handles the mc-typeahead/mc-text-field components that use Shadow DOM
  */
@@ -270,6 +438,33 @@ async function scrapeMaerskSpotRate(params) {
 
     const page = context.pages()[0] || await context.newPage();
 
+    // Detect OAuth / access_token failures during navigation/login
+    let oauthGrantFailed = false;
+    try {
+      page.on('response', async (res) => {
+        try {
+          const url = (res.url() || '').toLowerCase();
+          const status = res.status();
+          if (url.includes('/access_token') && status >= 400) {
+            oauthGrantFailed = true;
+            console.log('[Scraper] Detected OAuth access_token failure:', status, url);
+          }
+        } catch (e) { /* ignore */ }
+      });
+    } catch (e) { /* ignore */ }
+
+    // Optional tracing for detailed debug (enable with env ENABLE_TRACING=true)
+    const shouldTrace = (process.env.ENABLE_TRACING === 'true') || params.trace === true;
+    const tracePath = path.join(SNAPSHOT_DIR, `trace_${job_id}.zip`);
+    if (shouldTrace && context.tracing && typeof context.tracing.start === 'function') {
+      try {
+        await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+        console.log(`[Scraper] Tracing started: ${tracePath}`);
+      } catch (e) {
+        console.warn('[Scraper] Tracing start failed:', e.message);
+      }
+    }
+
     // Minimal stealth to hide automation
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
@@ -314,12 +509,26 @@ async function scrapeMaerskSpotRate(params) {
 
     // Check if we need to login
     let currentUrl = page.url();
-    let bookingFormVisible = await page.locator('#mc-input-origin, mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible({ timeout: 15000 }).catch(() => false);
+    let bookingFormVisible = await waitForVisibleWithRetries(page.locator('#mc-input-origin, mc-c-origin-destination, [data-test="mccOriginDestination"]').first(), 4, 1000).catch(() => false);
     
     // Check for "Access Denied" or Akamai challenge
     const pageTitle = await page.title().catch(() => '');
     const pageText = await page.evaluate(() => document.body.innerText.substring(0, 1000)).catch(() => '');
-    
+
+    // Detect captcha / anti-bot indicators early
+    if (await detectCaptcha(page)) {
+      const html = await page.content();
+      snapshotId = saveSnapshot(html, job_id);
+      await context.close();
+      return {
+        status: 'FAILED',
+        error: 'Captcha or anti-bot challenge detected on Maersk site',
+        reason_code: 'CAPTCHA_DETECTED',
+        snapshot_id: snapshotId,
+        candidates: [],
+      };
+    }
+
     if (pageTitle.includes('Access Denied') || pageText.includes('Access Denied') || pageText.includes('you don\'t have permission')) {
       const html = await page.content();
       snapshotId = saveSnapshot(html, job_id);
@@ -343,7 +552,7 @@ async function scrapeMaerskSpotRate(params) {
                !!document.querySelector('input[type="password"]');
       });
 
-      if (isActuallyLoginPage && !currentUrl.includes('accounts.maersk.com')) {
+            if (isActuallyLoginPage && !currentUrl.includes('accounts.maersk.com')) {
         console.log('[Scraper] Detected login elements on current page.');
       }
 
@@ -353,7 +562,7 @@ async function scrapeMaerskSpotRate(params) {
         await page.goto(BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
         await page.waitForTimeout(5000);
         currentUrl = page.url();
-        bookingFormVisible = await page.locator('mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible({ timeout: 5000 }).catch(() => false);
+        bookingFormVisible = await waitForVisibleWithRetries(page.locator('mc-c-origin-destination, [data-test="mccOriginDestination"]').first(), 3, 1000).catch(() => false);
       }
 
       // Check for a login/sign-in button that might need to be clicked
@@ -374,6 +583,8 @@ async function scrapeMaerskSpotRate(params) {
 
       if (currentUrl.includes('accounts.maersk.com') || !(await page.locator('mc-c-origin-destination, [data-test="mccOriginDestination"]').first().isVisible().catch(() => false))) {
         console.log('[Scraper] Performing automatic login...');
+        // Start debug capture
+        try { captureDebugArtifacts(page, job_id); } catch (e) { /* ignore */ }
         
         // Wait for login page to load
         await page.waitForTimeout(3000);
@@ -392,7 +603,12 @@ async function scrapeMaerskSpotRate(params) {
           'input[name="username"]',
           'input[id*="username"]',
           'mc-input[id*="username"] input',
-          '#username'
+          '#username',
+          'input[name="email"]',
+          'input[type="email"]',
+          'input[id*="user"]',
+          'input[name="login"]',
+          'input[id*="email"]'
         ];
         
         let usernameInput = null;
@@ -453,31 +669,207 @@ async function scrapeMaerskSpotRate(params) {
           }
           
           if (!loginSuccess) {
-            const html = await page.content();
-            snapshotId = saveSnapshot(html, job_id);
+            // Try one recovery: clear local storage/cookies and retry login once
+            console.log('[Scraper] Initial login attempt failed — trying recovery (clear storage and retry)...');
+            try {
+              await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); }).catch(() => {});
+              if (page.context() && page.context().clearCookies) {
+                await page.context().clearCookies().catch(() => {});
+              }
+            } catch (e) { /* ignore */ }
+
+            // Navigate back to book and retry login sequence once
+            await page.goto(BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await page.waitForTimeout(3000);
+
+            // Re-check for login elements
+            let retryLoginSuccess = false;
+            try {
+              for (let i = 0; i < 6; i++) {
+                const currentUrl2 = page.url();
+                if (currentUrl2.includes('maersk.com/book') && !currentUrl2.includes('accounts.maersk.com')) {
+                  const originVisible2 = await page.locator('#mc-input-origin, mc-c-origin-destination').first().isVisible({ timeout: 5000 }).catch(() => false);
+                  if (originVisible2) { retryLoginSuccess = true; break; }
+                }
+                await page.waitForTimeout(5000);
+              }
+            } catch (e) { /* ignore */ }
+
+            if (!retryLoginSuccess) {
+              // As a fallback, attempt explicit accounts.maersk.com login flow
+              try {
+                console.log('[Scraper] Attempting explicit accounts.maersk.com login');
+                await page.goto('https://accounts.maersk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+                await page.waitForTimeout(2000);
+                const acctUser = page.locator('input[name="username"], input[name="email"], input[type="email"], input[id*="email"]').first();
+                const acctPass = page.locator('input[type="password"]').first();
+                const acctBtn = page.locator('button[type="submit"], button:has-text("Sign in")').first();
+                if (await acctUser.isVisible({ timeout: 3000 }).catch(() => false)) {
+                  await acctUser.click(); await acctUser.fill(MAERSK_USERNAME); await page.waitForTimeout(300);
+                }
+                if (await acctPass.isVisible({ timeout: 3000 }).catch(() => false)) {
+                  await acctPass.click(); await acctPass.fill(MAERSK_PASSWORD); await page.waitForTimeout(300);
+                }
+                if (await acctBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                  await acctBtn.click(); await page.waitForTimeout(8000);
+                }
+              } catch (e) { console.log('[Scraper] accounts.maersk.com login attempt failed:', e.message); }
+
+              // Final check
+              const finalCheck = await page.locator('mc-c-origin-destination, #mc-input-origin, [data-test="mccOriginDestination"]').first().isVisible().catch(() => false);
+              if (!finalCheck) {
+                // If OAuth grant failed, attempt an explicit consent/authorize retry
+                if (oauthGrantFailed) {
+                  try {
+                    console.log('[Scraper] OAuth grant failed — attempting explicit accounts login + consent flow (retries)...');
+                    let recovered = false;
+                    for (let consentAttempt = 1; consentAttempt <= 3; consentAttempt++) {
+                      try {
+                        console.log(`[Scraper] Consent attempt ${consentAttempt}/3`);
+                        await page.goto('https://accounts.maersk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+                        await page.waitForTimeout(2000 + consentAttempt * 1000);
+
+                        // Clear storage/cookies between attempts to avoid stale state
+                        try { await context.clearCookies().catch(() => {}); } catch (e) {}
+                        try { await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); }).catch(() => {}); } catch (e) {}
+
+                        const acctUser = page.locator('input[name="username"], input[name="email"], input[type="email"], input[id*="email"]').first();
+                        const acctPass = page.locator('input[type="password"]').first();
+                        const acctBtn = page.locator('button[type="submit"], button:has-text("Sign in")').first();
+
+                        if (await acctUser.isVisible({ timeout: 3000 }).catch(() => false)) {
+                          await acctUser.click(); await acctUser.fill(MAERSK_USERNAME); await page.waitForTimeout(300);
+                        }
+                        if (await acctPass.isVisible({ timeout: 3000 }).catch(() => false)) {
+                          await acctPass.click(); await acctPass.fill(MAERSK_PASSWORD); await page.waitForTimeout(300);
+                        }
+                        if (await acctBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                          await acctBtn.click(); await page.waitForTimeout(5000 + consentAttempt * 1000);
+                        }
+
+                        // Try to click any consent/authorize buttons that may be part of OAuth flow
+                        await clickConsentButtons(page).catch(() => {});
+
+                        // Navigate back to booking to complete flow
+                        await page.goto(BOOK_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+                        await page.waitForTimeout(5000 + consentAttempt * 1000);
+                        const postConsentCheck = await page.locator('mc-c-origin-destination, #mc-input-origin, [data-test="mccOriginDestination"]').first().isVisible().catch(() => false);
+                        if (postConsentCheck) {
+                          console.log('[Scraper] Booking component visible after consent flow. Continuing.');
+                          recovered = true;
+                          break;
+                        }
+                      } catch (inner) {
+                        console.log('[Scraper] Consent attempt error:', inner.message);
+                      }
+                    }
+                    if (!recovered) console.log('[Scraper] Consent flow did not recover booking visibility after retries.');
+                  } catch (e) {
+                    console.log('[Scraper] Consent retry failed:', e.message);
+                  }
+                }
+
+                const html = await page.content();
+                snapshotId = saveSnapshot(html, job_id);
+                await context.close();
+                const reasonCode = oauthGrantFailed ? 'OAUTH_GRANT_FAILED' : 'LOGIN_FAILED';
+                const errorMsg = oauthGrantFailed ? 'OAuth grant failed (access_token endpoint returned error). Check SSO flow / consent.' : 'Login failed or timed out after retry. Check credentials and session.';
+                return {
+                  status: 'FAILED',
+                  error: errorMsg,
+                  reason_code: reasonCode,
+                  snapshot_id: snapshotId,
+                  candidates: [],
+                };
+              }
+            }
+          }
+        } else {
+            // Not on login page but also no booking form - try portal SSO heuristics and clicking login links
+          const currentUrl = page.url();
+
+            // Try to click any visible "Login" / "Sign in" link if present
+            try {
+              const loginLinkSelectors = [
+                'a:has-text("Login")',
+                'a:has-text("Sign in")',
+                'a:has-text("Log in")',
+                'button:has-text("Login")',
+                'button:has-text("Sign in")',
+                'button:has-text("Log in")',
+                '[data-test="login"]',
+              ];
+              for (const sel of loginLinkSelectors) {
+                const el = page.locator(sel).first();
+                if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
+                  console.log(`[Scraper] Clicking login link: ${sel}`);
+                  await el.click({ force: true }).catch(() => {});
+                  await page.waitForTimeout(4000);
+                  break;
+                }
+              }
+            } catch (e) { /* ignore */ }
+
+            // If still on a portal login URL, try portal SSO heuristics
+          if (currentUrl.includes('portaluser') || currentUrl.includes('login')) {
+            console.log('[Scraper] Detected portal SSO URL — attempting alternative login selectors...');
+            try {
+              const altUsername = page.locator('input[name="email"], input[type="email"], input[id*="user"], input[id*="email"]').first();
+              const altPassword = page.locator('input[type="password"]').first();
+              const altSubmit = page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")').first();
+
+              if (await altUsername.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await altUsername.click();
+                await altUsername.fill(MAERSK_USERNAME);
+                await page.waitForTimeout(300);
+              }
+              if (await altPassword.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await altPassword.click();
+                await altPassword.fill(MAERSK_PASSWORD);
+                await page.waitForTimeout(300);
+              }
+              if (await altSubmit.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await altSubmit.click();
+                console.log('[Scraper] Clicked portal submit button, waiting for redirect...');
+                await page.waitForTimeout(8000);
+                // Continue checking for booking form below by allowing flow to continue
+              }
+            } catch (e) {
+              console.log('[Scraper] Portal SSO login attempt failed:', e.message);
+            }
+          }
+
+          // After attempting portal heuristics / clicking login, re-evaluate booking form visibility
+          const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => 'No text');
+          const html = await page.content();
+          snapshotId = saveSnapshot(html, job_id);
+          const newBookingVisible = await page.locator('mc-c-origin-destination, #mc-input-origin, [data-test="mccOriginDestination"]').first().isVisible().catch(() => false);
+          if (newBookingVisible) {
+            console.log('[Scraper] Booking component became visible after portal login attempt; continuing.');
+          } else {
+            // If this appears to be an SSO/portal or OAuth grant failure, surface a clearer reason
+            if (await detectPortalLogin(page)) {
+              await context.close();
+              const reasonCode = oauthGrantFailed ? 'OAUTH_GRANT_FAILED' : 'LOGIN_FAILED';
+              const errorMsg = oauthGrantFailed ? `OAuth grant failed or portal SSO required. URL: ${currentUrl}. Snippet: ${bodyText.replace(/\n/g, ' ')}` : `Portal/SSO login required. URL: ${currentUrl}. Snippet: ${bodyText.replace(/\n/g, ' ')}`;
+              return {
+                status: 'FAILED',
+                error: errorMsg,
+                reason_code: reasonCode,
+                snapshot_id: snapshotId,
+                candidates: [],
+              };
+            }
+
             await context.close();
             return {
               status: 'FAILED',
-              error: 'Login failed or timed out. Check credentials.',
-              reason_code: 'LOGIN_FAILED',
+              error: `Unknown page state. URL: ${currentUrl}. Snippet: ${bodyText.replace(/\n/g, ' ')}`,
+              reason_code: 'UNKNOWN_STATE',
               snapshot_id: snapshotId,
               candidates: [],
             };
           }
-        } else {
-          // Not on login page but also no booking form - unknown state
-          const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => 'No text');
-          const currentUrl = page.url();
-          const html = await page.content();
-          snapshotId = saveSnapshot(html, job_id);
-          await context.close();
-          return {
-            status: 'FAILED',
-            error: `Unknown page state. URL: ${currentUrl}. Snippet: ${bodyText.replace(/\n/g, ' ')}`,
-            reason_code: 'UNKNOWN_STATE',
-            snapshot_id: snapshotId,
-            candidates: [],
-          };
         }
       }
     }
@@ -629,13 +1021,30 @@ async function scrapeMaerskSpotRate(params) {
             await containerSelect.click();
             await page.waitForTimeout(800);
             
-            const optionLabel = CONTAINER_MAP[container_type];
+            let optionLabel = CONTAINER_MAP[container_type];
+            if (!optionLabel) {
+              // If frontend sends the exact label (e.g. '40 Dry Standard'), accept it directly
+              optionLabel = container_type;
+            }
             const option = page.locator(`[role="option"]:has-text("${optionLabel}"), option:has-text("${optionLabel}"), .mc-select__option:has-text("${optionLabel}")`).first();
             
             if (await option.isVisible({ timeout: 2000 }).catch(() => false)) {
               await option.click();
               console.log(`[Scraper] Selected container type: ${optionLabel}`);
               await page.waitForTimeout(1000);
+              // Verify selection from DOM (best-effort)
+              try {
+                const selectedText = await page.evaluate(() => {
+                  const sel = document.querySelector('select[name*="container"]');
+                  if (sel && sel.selectedIndex >= 0) return sel.options[sel.selectedIndex].textContent.trim();
+                  const valEl = document.querySelector('.mc-select .mc-select__value, .mc-select__selected');
+                  if (valEl) return valEl.textContent.trim();
+                  return null;
+                }).catch(() => null);
+                if (selectedText && selectedText.toLowerCase() !== optionLabel.toLowerCase()) {
+                  console.log(`[Scraper] WARNING: selected container text mismatch. expected="${optionLabel}", actual="${selectedText}"`);
+                }
+              } catch (e) { /* ignore verification errors */ }
               break;
             } else {
               // Try selectOption for native select
@@ -819,6 +1228,14 @@ async function scrapeMaerskSpotRate(params) {
             snapshotId = saveSnapshot(html, job_id);
           }
         }
+        // Stop tracing if enabled and save
+        try {
+          if ((process.env.ENABLE_TRACING === 'true' || params.trace === true) && context.tracing && typeof context.tracing.stop === 'function') {
+            await context.tracing.stop({ path: tracePath }).catch(() => {});
+            console.log(`[Scraper] Tracing saved: ${tracePath}`);
+          }
+        } catch (e) { /* ignore */ }
+
         await context.close();
       } catch { /* ignore */ }
     }
@@ -921,3 +1338,10 @@ module.exports = {
   simulateScrape,
   scrapeMaerskSpotRate,
 };
+
+// Export helpers for testing
+module.exports.detectCaptcha = detectCaptcha;
+module.exports.waitForVisibleWithRetries = waitForVisibleWithRetries;
+module.exports.detectConsent = detectConsent;
+module.exports.detectAccessDenied = detectAccessDenied;
+module.exports.isBookingVisible = isBookingVisible;

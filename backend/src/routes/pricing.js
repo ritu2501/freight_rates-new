@@ -87,7 +87,7 @@ router.get('/ports', (req, res) => {
 // ─── List pricing with optional filters ────────────────────────────────
 router.get('/', (req, res) => {
   const db = getDb();
-  const { country, pol, pod, container_type, incoterm } = req.query;
+  const { country, pol, pod, container_type } = req.query;
 
   let sql = `SELECT * FROM pricing WHERE 1=1`;
   const params = [];
@@ -108,10 +108,7 @@ router.get('/', (req, res) => {
     sql += ` AND container_type = ?`;
     params.push(container_type);
   }
-  if (incoterm) {
-    sql += ` AND incoterm = ?`;
-    params.push(incoterm);
-  }
+  // incoterm filter removed (no longer used)
 
   sql += ` ORDER BY month_label DESC, from_port, to_port`;
 
@@ -122,7 +119,7 @@ router.get('/', (req, res) => {
 // ─── Quick check — internal lookup ─────────────────────────────────────
 router.post('/check', (req, res) => {
   const db = getDb();
-  const { from_port, to_port, ship_date, container_type } = req.body;
+  const { from_port, to_port, container_type } = req.body;
 
   if (!from_port || !to_port) {
     return res.status(400).json({
@@ -176,8 +173,8 @@ router.post('/scrape', async (req, res) => {
   const db = getDb();
   const {
     from_port, to_port, container_type, number_of_containers,
-    weight_per_container, weight_unit, ship_date, commodity,
-    incoterm, price_owner, use_live_scraper,
+    weight_per_container, weight_unit, commodity,
+    price_owner, use_live_scraper,
     origin_inland, destination_inland,
   } = req.body;
 
@@ -192,16 +189,15 @@ router.post('/scrape', async (req, res) => {
 
   const jobId = uuidv4();
   const ct = container_type || '40FT';
-  const inc = incoterm || 'EXW';
 
   // Insert scrape job
   db.prepare(`
     INSERT INTO scrape_jobs (id, from_port, to_port, container_type, number_of_containers,
-      weight_per_container, weight_unit, ship_date, commodity, incoterm, origin_inland, destination_inland, price_owner, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')
+      weight_per_container, weight_unit, commodity, origin_inland, destination_inland, price_owner, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')
   `).run(jobId, from_port, to_port, ct,
     number_of_containers || 1, weight_per_container || null,
-    weight_unit || 'kg', ship_date || null, commodity || null, inc,
+    weight_unit || 'kg', commodity || null,
     origin_inland || 'CY', destination_inland || 'CY',
     price_owner || 'system');
 
@@ -269,19 +265,19 @@ router.post('/scrape', async (req, res) => {
 
         const destPort = db.prepare(`SELECT country FROM port_aliases WHERE alias = ? COLLATE NOCASE`).get(to_port);
         const destCountry = destPort ? destPort.country : null;
-        const monthLabel = formatMonthLabel(ship_date);
+        const monthLabel = null;
 
         const pricingInsert = db.prepare(`
           INSERT INTO pricing (
-            from_port, to_port, destination_country, container_type, incoterm, month_label,
+            from_port, to_port, destination_country, container_type, month_label,
             origin_inland, destination_inland, origin_local_haulage, origin_thc, customs, origin_misc,
             ocean_freight, destination_thc, destination_haulage, destination_misc,
             total_price, currency, transit_days, service_type,
             source, confidence_score, valid_until, snapshot_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, ?, ?)
         `).run(
           from_port.toUpperCase(), to_port.toUpperCase(), destCountry,
-          ct, inc, monthLabel,
+          ct, monthLabel,
           origin_inland || 'CY', destination_inland || 'CY',
           autoAccepted.origin_local_haulage || null,
           autoAccepted.origin_thc || null,
@@ -298,10 +294,10 @@ router.post('/scrape', async (req, res) => {
 
         // Audit trail
         db.prepare(`
-          INSERT INTO pricing_history (pricing_id, from_port, to_port, container_type, incoterm, price, currency, source, snapshot_id, action, actor, reason)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, 'AUTO_ACCEPT', 'system', 'High-confidence auto-accept')
+          INSERT INTO pricing_history (pricing_id, from_port, to_port, container_type, price, currency, source, snapshot_id, action, actor, reason)
+          VALUES (?, ?, ?, ?, ?, ?, 'SCRAPE', ?, 'AUTO_ACCEPT', 'system', 'High-confidence auto-accept')
         `).run(pricingInsert.lastInsertRowid, from_port.toUpperCase(), to_port.toUpperCase(),
-          ct, inc, autoAccepted.total_price || autoAccepted.price,
+          ct, autoAccepted.total_price || autoAccepted.price,
           autoAccepted.currency, autoAccepted.snapshot_id);
       }
 
@@ -322,6 +318,11 @@ router.post('/accept', (req, res) => {
     return res.status(400).json({ status: 'INVALID_REQUEST', message: 'job_id required' });
   }
 
+  // Require an actor for audit trail
+  if (!actor || String(actor).trim() === '') {
+    return res.status(400).json({ status: 'INVALID_REQUEST', message: 'actor is required' });
+  }
+
   const job = db.prepare(`SELECT * FROM scrape_jobs WHERE id = ?`).get(job_id);
   if (!job) {
     return res.status(404).json({ status: 'NOT_FOUND', message: 'Job not found' });
@@ -337,20 +338,20 @@ router.post('/accept', (req, res) => {
   // Look up destination country
   const destPort = db.prepare(`SELECT country FROM port_aliases WHERE alias = ? COLLATE NOCASE`).get(job.to_port);
   const destCountry = destPort ? destPort.country : null;
-  const monthLabel = formatMonthLabel(job.ship_date);
+  const monthLabel = null;
 
   const insertResult = db.prepare(`
     INSERT INTO pricing (
-      from_port, to_port, destination_country, container_type, incoterm, month_label,
+      from_port, to_port, destination_country, container_type, month_label,
       origin_inland, destination_inland,
       origin_local_haulage, origin_thc, customs, origin_misc,
       ocean_freight, destination_thc, destination_haulage, destination_misc,
       total_price, currency, transit_days, service_type,
       source, confidence_score, valid_until, snapshot_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, ?, ?)
   `).run(
     job.from_port.toUpperCase(), job.to_port.toUpperCase(), destCountry,
-    job.container_type, job.incoterm, monthLabel,
+    job.container_type, monthLabel,
     job.origin_inland || 'CY', job.destination_inland || 'CY',
     candidate.origin_local_haulage || null,
     candidate.origin_thc || null,
@@ -369,10 +370,10 @@ router.post('/accept', (req, res) => {
 
   // Audit trail
   db.prepare(`
-    INSERT INTO pricing_history (pricing_id, from_port, to_port, container_type, incoterm, price, currency, source, snapshot_id, action, actor, reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, 'AGENT_ACCEPT', ?, 'Agent accepted scraped rate')
+    INSERT INTO pricing_history (pricing_id, from_port, to_port, container_type, price, currency, source, snapshot_id, action, actor, reason)
+    VALUES (?, ?, ?, ?, ?, ?, 'SCRAPE', ?, 'AGENT_ACCEPT', ?, 'Agent accepted scraped rate')
   `).run(pricingId, job.from_port.toUpperCase(), job.to_port.toUpperCase(),
-    job.container_type, job.incoterm, candidate.total_price || candidate.price,
+    job.container_type, candidate.total_price || candidate.price,
     candidate.currency, candidate.snapshot_id, actor || 'agent');
 
   res.json({

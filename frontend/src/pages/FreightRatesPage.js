@@ -9,7 +9,7 @@ const COLUMNS = [
   { key: 'from_port',            label: 'Port of Loading' },
   { key: 'destination_country',  label: 'Destination Country' },
   { key: 'to_port',              label: 'Port of Destination' },
-  { key: 'incoterm',             label: 'Incoterms' },
+  // Incoterms removed from UI
   { key: 'origin_local_haulage', label: 'Origin Local Haulage', numeric: true },
   { key: 'origin_thc',           label: 'Origin THC',           numeric: true },
   { key: 'customs',              label: 'Customs',              numeric: true },
@@ -101,8 +101,7 @@ export default function FreightRatesPage() {
     setScrapePrefill({
       from_port: row?.from_port || selectedPol || '',
       to_port: row?.to_port || selectedPod || '',
-      container_type: row?.container_type || '40HIGH',
-      incoterm: row?.incoterm || 'EXW',
+      container_type: row?.container_type || '40 Dry High',
       weight_per_container: row?.weight_per_container || '',
       number_of_containers: row?.number_of_containers || 1,
       origin_inland: row?.origin_inland || 'CY',

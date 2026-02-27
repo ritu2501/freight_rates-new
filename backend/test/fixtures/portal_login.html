@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Portal SSO Login (fixture)</title>
+  <style>body{font-family:Arial,Helvetica,sans-serif;padding:20px} .panel{max-width:600px;margin:0 auto;border:1px solid #ddd;padding:16px;border-radius:6px}</style>
+</head>
+<body>
+  <div class="panel">
+    <h2>Sign in to your account</h2>
+    <div id="coiOverlay" style="background:#fff8c4;border:1px solid #e2c; padding:8px;margin-bottom:12px">We use cookies to improve your experience. <button id="accept-cookies">Accept</button></div>
+    <form id="sso-form" action="https://accounts.maersk.com/oauth2/authorize" method="post">
+      <label for="email">Email</label><br/>
+      <input id="email" name="email" type="email" value="" /><br/><br/>
+      <label for="password">Password</label><br/>
+      <input id="password" name="password" type="password" value="" /><br/><br/>
+      <button type="submit">Sign in</button>
+    </form>
+
+    <div style="margin-top:12px">
+      <button id="consent-allow">Allow</button>
+      <button id="consent-deny">Deny</button>
+    </div>
+
+    <script>
+      // simulate showing consent after sign-in
+      document.getElementById('sso-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        document.getElementById('sso-form').style.display = 'none';
+        var t = document.createElement('div');
+        t.id = 'consent';
+        t.innerHTML = '<h3>Authorize Application</h3><p>The application requests access to your Maersk account.</p>';
+        document.querySelector('.panel').appendChild(t);
+      });
+      document.getElementById('accept-cookies').addEventListener('click', function () { document.getElementById('coiOverlay').remove(); });
+      document.getElementById('consent-allow').addEventListener('click', function () { alert('consent-granted'); });
+      document.getElementById('consent-deny').addEventListener('click', function () { alert('consent-denied'); });
+    </script>
+  </div>
+</body>
+</html>

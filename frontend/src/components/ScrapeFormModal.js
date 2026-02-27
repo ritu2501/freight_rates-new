@@ -15,13 +15,12 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
     to_port: prefill?.to_port || '',
     origin_inland: prefill?.origin_inland || 'CY',
     destination_inland: prefill?.destination_inland || 'CY',
-    container_type: prefill?.container_type || '40HIGH',
+    container_type: prefill?.container_type || '40 Dry High',
     number_of_containers: prefill?.number_of_containers || 1,
     weight_per_container: prefill?.weight_per_container || '',
     weight_unit: prefill?.weight_unit || 'kg',
     commodity: 'Wastepaper',
     price_owner: prefill?.price_owner || 'self',
-    ship_date: prefill?.ship_date || '',
   });
 
   const [loading, setLoading] = useState(false);
@@ -56,10 +55,11 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
     setError(null);
 
     try {
+      const { ship_date, ...formRest } = form;
       const payload = {
-        ...form,
+        ...formRest,
         number_of_containers: parseInt(form.number_of_containers) || 1,
-        weight_per_container: form.weight_per_container ? parseFloat(form.weight_per_container) : undefined,
+        weight_per_container: form.weight_per_container ? (Number(form.weight_per_container) % 1 === 0 ? parseInt(form.weight_per_container, 10) : parseFloat(form.weight_per_container)) : undefined,
         weight_unit: form.weight_unit || 'kg',
       };
       const result = await triggerScrape(payload);
@@ -238,7 +238,7 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
                   >
                     <option value="">Select container type and size</option>
                     {CONTAINER_TYPES.map((ct) => (
-                      <option key={ct.value} value={ct.value}>{ct.label}</option>
+                      <option key={ct.value} value={ct.label}>{ct.label}</option>
                     ))}
                   </select>
                   {validation.container_type && <span className="field-error">{validation.container_type}</span>}
@@ -309,26 +309,7 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
               {validation.price_owner && <span className="field-error">{validation.price_owner}</span>}
             </div>
 
-            {/* ── Section 5: When is your cargo ready to ship? ── */}
-            <div className="form-section">
-              <h3 className="section-title">When is your cargo ready to ship?</h3>
-              <p className="section-subtitle">Optional — leave empty to skip</p>
-
-              <div className="form-group" style={{ maxWidth: 280 }}>
-                <label>Departure date</label>
-                <input
-                  name="ship_date"
-                  type="date"
-                  value={form.ship_date}
-                  onChange={handleChange}
-                  placeholder="Optional"
-                  min={new Date().toISOString().split('T')[0]}
-                />
-                <span style={{ fontSize: 11, color: '#94a3b8', marginTop: 4, display: 'block' }}>
-                  Optional — not required for getting rates
-                </span>
-              </div>
-            </div>
+            {/* ship_date removed — date is optional and not used for rate retrieval */}
           </div>
 
           <div className="modal-footer">

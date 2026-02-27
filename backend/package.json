@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "node src/index.js",
     "seed": "node src/db/seed.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "e2e": "node test/e2e/run_tests.js",
+    "monitor": "node tools/check_failures.js",
+    "alert": "node tools/check_and_alert.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -16,6 +19,7 @@
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "sql.js": "^1.11.0",
-    "uuid": "^10.0.0"
+    "uuid": "^10.0.0",
+    "@octokit/rest": "^20.0.2"
   }
 }

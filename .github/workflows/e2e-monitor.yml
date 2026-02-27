@@ -1,0 +1,39 @@
+name: E2E Monitor
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * *' # run daily at 02:00 UTC
+
+jobs:
+  e2e-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Run E2E fixtures
+        working-directory: backend
+        run: npm run e2e
+
+      - name: Run failure summary
+        working-directory: backend
+        run: npm run monitor
+
+      - name: Create alert issue if failures
+        if: always()
+        working-directory: backend
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          npm run alert || echo "No alert created or alert script failed"
