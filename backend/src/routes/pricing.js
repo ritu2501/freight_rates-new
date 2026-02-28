@@ -19,6 +19,69 @@ const { validateCandidates } = require('../validation/validator');
 
 const router = express.Router();
 
+/**
+ * Input validation middleware
+ */
+function validatePort(port) {
+  if (!port || typeof port !== 'string' || port.trim().length === 0) return false;
+  // Allow alphanumeric, spaces, and hyphens
+  return /^[a-zA-Z0-9\s\-]{2,10}$/.test(port.trim());
+}
+
+// Container type mapping (short code => display format)
+const CONTAINER_TYPE_MAP = {
+  '20FT': '20\' Dry',
+  '40FT': '40\' Dry',
+  '40HC': '40\' High Cube Dry',
+  '40HIGH': '40\' High Cube Dry',
+  '45FT': '45\' High Cube Dry',
+  'REEFER': '40\' Reefer High Cube',
+  'OOG': '40\' Open Top',
+};
+
+// Create reverse map for validation (what frontend sends)
+const REVERSE_CONTAINER_MAP = {
+  '20 DRY': '20FT',
+  '40 DRY': '40FT',
+  '40 HIGH CUBE DRY': '40HC',
+  '40 REEFER HIGH CUBE': 'REEFER',
+  '40 OPEN TOP': 'OOG',
+  '45 HIGH CUBE DRY': '45FT',
+  // Also accept short codes
+  '20FT': '20FT',
+  '40FT': '40FT',
+  '40HC': '40HC',
+  '40HIGH': '40HIGH',
+  '45FT': '45FT',
+  'REEFER': 'REEFER',
+  'OOG': 'OOG',
+};
+
+function normalizeContainerType(type) {
+  if (!type) return null;
+  // Try exact match first (handles "40FT" etc)
+  const normalized = type.toUpperCase().trim().replace(/['']/g, "'");
+  
+  // Check direct short code match
+  if (REVERSE_CONTAINER_MAP[normalized]) {
+    return REVERSE_CONTAINER_MAP[normalized];
+  }
+  
+  // Try to match with word-based lookup (handles "40 Dry", "40 High Cube Dry" etc)
+  const simplified = type.toUpperCase().replace(/[''`]/g, '').trim();
+  if (REVERSE_CONTAINER_MAP[simplified]) {
+    return REVERSE_CONTAINER_MAP[simplified];
+  }
+  
+  return null; // Invalid type
+}
+
+function validateContainerType(type) {
+  if (!type) return true; // Optional, has default
+  const normalized = normalizeContainerType(type);
+  return normalized !== null;
+}
+
 // ─── List destination countries ────────────────────────────────────────
 router.get('/countries', (req, res) => {
   const db = getDb();
@@ -183,26 +246,41 @@ router.post('/scrape', async (req, res) => {
 
   // Validate required fields
   const errors = [];
-  if (!from_port) errors.push({ field: 'from_port', message: 'Required' });
-  if (!to_port) errors.push({ field: 'to_port', message: 'Required' });
+  if (!validatePort(from_port)) errors.push({ field: 'from_port', message: 'Required and must be 2-10 alphanumeric characters' });
+  if (!validatePort(to_port)) errors.push({ field: 'to_port', message: 'Required and must be 2-10 alphanumeric characters' });
+  if (container_type && !validateContainerType(container_type)) {
+    errors.push({ field: 'container_type', message: 'Invalid container type. Valid types: 20FT, 40FT, 40HC, 40HIGH, 45FT, REEFER, OOG or their display formats (e.g., "40 Dry", "40 High Cube Dry")' });
+  }
+  if (number_of_containers && (typeof number_of_containers !== 'number' || number_of_containers < 1)) {
+    errors.push({ field: 'number_of_containers', message: 'Must be a positive number' });
+  }
 
   if (errors.length) {
     return res.status(400).json({ status: 'INVALID_REQUEST', errors });
   }
 
   const jobId = uuidv4();
-  const ct = container_type || '40FT';
+  // Normalize container type to standard code (e.g., "40 Dry High" -> "40HC")
+  const ct = normalizeContainerType(container_type) || '40FT';
 
   // Insert scrape job
-  db.prepare(`
-    INSERT INTO scrape_jobs (id, from_port, to_port, container_type, number_of_containers,
-      weight_per_container, weight_unit, commodity, origin_inland, destination_inland, price_owner, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')
-  `).run(jobId, from_port, to_port, ct,
-    number_of_containers || 1, weight_per_container || null,
-    weight_unit || 'kg', commodity || null,
-    origin_inland || 'CY', destination_inland || 'CY',
-    price_owner || 'system');
+  try {
+    db.prepare(`
+      INSERT INTO scrape_jobs (id, from_port, to_port, container_type, number_of_containers,
+        weight_per_container, weight_unit, commodity, origin_inland, destination_inland, price_owner, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')
+    `).run(jobId, from_port.toUpperCase(), to_port.toUpperCase(), ct,
+      number_of_containers || 1, weight_per_container || null,
+      weight_unit || 'kg', commodity || null,
+      origin_inland || 'CY', destination_inland || 'CY',
+      price_owner || 'system');
+  } catch (dbErr) {
+    console.error('[API] Failed to insert scrape job:', dbErr.message);
+    return res.status(500).json({
+      status: 'DATABASE_ERROR',
+      message: 'Failed to create scrape job'
+    });
+  }
 
   // Respond immediately with job ID
   res.json({
@@ -221,20 +299,41 @@ router.post('/scrape', async (req, res) => {
       console.log(`[API] Background Job ${jobId} | Mode: ${liveMode ? 'LIVE' : 'SIM'}`);
 
       let scrapeResult;
-      if (liveMode) {
-        scrapeResult = await scrapeMaerskSpotRate({ ...req.body, job_id: jobId });
-      } else {
-        scrapeResult = simulateScrape({ ...req.body, job_id: jobId });
+      try {
+        if (liveMode) {
+          scrapeResult = await scrapeMaerskSpotRate({ ...req.body, job_id: jobId });
+        } else {
+          scrapeResult = simulateScrape({ ...req.body, job_id: jobId });
+        }
+      } catch (scrapeErr) {
+        console.error(`[API] Job ${jobId} Scrape error:`, {
+          message: scrapeErr.message,
+          code: scrapeErr.code,
+          stack: scrapeErr.stack
+        });
+
+        try {
+          db.prepare(`UPDATE scrape_jobs SET status='FAILED', error_message=?, updated_at=datetime('now') WHERE id=?`)
+            .run(`Scrape error: ${scrapeErr.message}`, jobId);
+          db.prepare(`INSERT INTO failure_records (scrape_job_id, reason_code, details) VALUES (?, ?, ?)`)
+            .run(jobId, 'SCRAPER_ERROR', scrapeErr.message || '');
+        } catch (updateErr) {
+          console.error(`[API] Job ${jobId} Failed to update failure record:`, updateErr.message);
+        }
+        return;
       }
 
       if (scrapeResult.status === 'FAILED') {
+        console.warn(`[API] Job ${jobId} Scrape returned FAILED status:`, scrapeResult.reason_code);
         db.prepare(`UPDATE scrape_jobs SET status='FAILED', error_message=?, snapshot_id=?, updated_at=datetime('now') WHERE id=?`)
           .run(scrapeResult.error || 'Unknown error', scrapeResult.snapshot_id || null, jobId);
 
         try {
           db.prepare(`INSERT INTO failure_records (scrape_job_id, reason_code, details) VALUES (?, ?, ?)`)
             .run(jobId, scrapeResult.reason_code || 'SCRAPER_ERROR', scrapeResult.error || '');
-        } catch { /* ignore if table missing */ }
+        } catch (e) {
+          console.error(`[API] Job ${jobId} Failed to insert failure record:`, e.message);
+        }
         return;
       }
 
@@ -264,50 +363,67 @@ router.post('/scrape', async (req, res) => {
       // Auto-accept top candidate if applicable
       const autoAccepted = finalCandidates.find(c => c.validation.outcome === 'AUTO_ACCEPT');
       if (autoAccepted) {
-        console.log(`[API] Job ${jobId} Auto-Accepting candidate:`, autoAccepted.price);
+        try {
+          console.log(`[API] Job ${jobId} Auto-Accepting candidate:`, autoAccepted.price);
 
-        const destPort = db.prepare(`SELECT country FROM port_aliases WHERE alias = ? COLLATE NOCASE`).get(to_port);
-        const destCountry = destPort ? destPort.country : null;
-        const monthLabel = null;
+          const destPort = db.prepare(`SELECT country FROM port_aliases WHERE alias = ? COLLATE NOCASE`).get(to_port);
+          const destCountry = destPort ? destPort.country : null;
+          const monthLabel = null;
 
-        const pricingInsert = db.prepare(`
-          INSERT INTO pricing (
-            from_port, to_port, destination_country, container_type, month_label,
-            origin_inland, destination_inland, origin_local_haulage, origin_thc, customs, origin_misc,
-            ocean_freight, destination_thc, destination_haulage, destination_misc,
-            total_price, currency, transit_days, service_type,
-            source, confidence_score, valid_until, snapshot_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, ?, ?)
-        `).run(
-          from_port.toUpperCase(), to_port.toUpperCase(), destCountry,
-          ct, monthLabel,
-          origin_inland || 'CY', destination_inland || 'CY',
-          autoAccepted.origin_local_haulage || null,
-          autoAccepted.origin_thc || null,
-          autoAccepted.customs || null,
-          autoAccepted.origin_misc || null,
-          autoAccepted.ocean_freight || autoAccepted.price,
-          autoAccepted.destination_thc || null,
-          autoAccepted.destination_haulage || null,
-          autoAccepted.destination_misc || null,
-          autoAccepted.total_price || autoAccepted.price,
-          autoAccepted.currency, autoAccepted.transit_days, autoAccepted.service_type,
-          autoAccepted.confidence_score, autoAccepted.valid_until, autoAccepted.snapshot_id
-        );
+          const pricingInsert = db.prepare(`
+            INSERT INTO pricing (
+              from_port, to_port, destination_country, container_type, month_label,
+              origin_inland, destination_inland, origin_local_haulage, origin_thc, customs, origin_misc,
+              ocean_freight, destination_thc, destination_haulage, destination_misc,
+              total_price, currency, transit_days, service_type,
+              source, confidence_score, valid_until, snapshot_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCRAPE', ?, ?, ?)
+          `).run(
+            from_port.toUpperCase(), to_port.toUpperCase(), destCountry,
+            ct, monthLabel,
+            origin_inland || 'CY', destination_inland || 'CY',
+            autoAccepted.origin_local_haulage || null,
+            autoAccepted.origin_thc || null,
+            autoAccepted.customs || null,
+            autoAccepted.origin_misc || null,
+            autoAccepted.ocean_freight || autoAccepted.price,
+            autoAccepted.destination_thc || null,
+            autoAccepted.destination_haulage || null,
+            autoAccepted.destination_misc || null,
+            autoAccepted.total_price || autoAccepted.price,
+            autoAccepted.currency, autoAccepted.transit_days, autoAccepted.service_type,
+            autoAccepted.confidence_score, autoAccepted.valid_until, autoAccepted.snapshot_id
+          );
 
-        // Audit trail
-        db.prepare(`
-          INSERT INTO pricing_history (pricing_id, from_port, to_port, container_type, price, currency, source, snapshot_id, action, actor, reason)
-          VALUES (?, ?, ?, ?, ?, ?, 'SCRAPE', ?, 'AUTO_ACCEPT', 'system', 'High-confidence auto-accept')
-        `).run(pricingInsert.lastInsertRowid, from_port.toUpperCase(), to_port.toUpperCase(),
-          ct, autoAccepted.total_price || autoAccepted.price,
-          autoAccepted.currency, autoAccepted.snapshot_id);
+          // Audit trail
+          db.prepare(`
+            INSERT INTO pricing_history (pricing_id, from_port, to_port, container_type, price, currency, source, snapshot_id, action, actor, reason)
+            VALUES (?, ?, ?, ?, ?, ?, 'SCRAPE', ?, 'AUTO_ACCEPT', 'system', 'High-confidence auto-accept')
+          `).run(pricingInsert.lastInsertRowid, from_port.toUpperCase(), to_port.toUpperCase(),
+            ct, autoAccepted.total_price || autoAccepted.price,
+            autoAccepted.currency, autoAccepted.snapshot_id);
+
+          console.log(`[API] Job ${jobId} Auto-accept completed successfully`);
+        } catch (acceptErr) {
+          console.error(`[API] Job ${jobId} Error during auto-accept:`, {
+            message: acceptErr.message,
+            stack: acceptErr.stack
+          });
+          // Don't fail the job - it had successful scrape results
+        }
       }
 
     } catch (err) {
-      console.error(`[API] Background Scrape Exception (Job ${jobId}):`, err);
-      db.prepare(`UPDATE scrape_jobs SET status='FAILED', error_message=?, updated_at=datetime('now') WHERE id=?`)
-        .run(err.message, jobId);
+      console.error(`[API] Background Scrape Exception (Job ${jobId}):`, {
+        message: err.message,
+        stack: err.stack
+      });
+      try {
+        db.prepare(`UPDATE scrape_jobs SET status='FAILED', error_message=?, updated_at=datetime('now') WHERE id=?`)
+          .run(`Background error: ${err.message}`, jobId);
+      } catch (updateErr) {
+        console.error(`[API] Job ${jobId} Failed to update final error:`, updateErr.message);
+      }
     }
   });
 });

@@ -2,10 +2,10 @@ import React, { useState } from 'react';
 import { triggerScrape, getScrapeJob } from '../api';
 
 const CONTAINER_TYPES = [
-  { value: '20DRY',  label: '20 Dry Standard' },
-  { value: '40DRY',  label: '40 Dry Standard' },
-  { value: '40HIGH', label: '40 Dry High' },
-  { value: '45HIGH', label: '45 Dry High' },
+  { value: '20FT',  label: '20 Dry Standard' },
+  { value: '40FT',  label: '40 Dry Standard' },
+  { value: '40HC', label: '40 High Cube Dry' },
+  { value: '45FT', label: '45 High Cube Dry' },
 ];
 
 
@@ -15,7 +15,7 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
     to_port: prefill?.to_port || '',
     origin_inland: prefill?.origin_inland || 'CY',
     destination_inland: prefill?.destination_inland || 'CY',
-    container_type: prefill?.container_type || '40 Dry High',
+    container_type: prefill?.container_type || '40HC',
     number_of_containers: prefill?.number_of_containers || 1,
     weight_per_container: prefill?.weight_per_container || '',
     weight_unit: prefill?.weight_unit || 'kg',
@@ -72,7 +72,7 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
             const job = await getScrapeJob(result.job_id);
             if (job.status === 'SUCCESS' || job.status === 'FAILED') {
               setPolling(false);
-              onResult({ ...job, formData: payload });
+              onResult({ ...job, job_id: job.id, formData: payload });
             } else if (pollCount < 60) { // up to 5 min
               pollCount++;
               setTimeout(poll, 5000);
@@ -88,7 +88,7 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
         poll();
       } else {
         // If backend returned a structured no-results or failed status, show it in the results modal
-        onResult({ ...result, formData: payload });
+        onResult({ ...result, job_id: result.job_id, formData: payload });
       }
     } catch (err) {
       const msg = err.response?.data?.message || err.message || '';
@@ -238,7 +238,7 @@ export default function ScrapeFormModal({ prefill, onClose, onResult }) {
                   >
                     <option value="">Select container type and size</option>
                     {CONTAINER_TYPES.map((ct) => (
-                      <option key={ct.value} value={ct.label}>{ct.label}</option>
+                      <option key={ct.value} value={ct.value}>{ct.label}</option>
                     ))}
                   </select>
                   {validation.container_type && <span className="field-error">{validation.container_type}</span>}

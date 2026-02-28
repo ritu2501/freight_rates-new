@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import { acceptRate } from '../api';
 
 const CONTAINER_LABELS = {
-  '20DRY': '20 Dry Standard', '40DRY': '40 Dry Standard', '40HIGH': '40 Dry High',
-  '45HIGH': '45 Dry High',
-  '20FT': '20 Dry Standard', '40FT': '40 Dry Standard', '40HC': '40 Dry High', '45FT': '45 Dry High',
+  '20FT': '20 Dry Standard',
+  '40FT': '40 Dry Standard',
+  '40HC': '40 High Cube Dry',
+  '45FT': '45 High Cube Dry',
 };
 
 function formatDateCard(dateStr) {

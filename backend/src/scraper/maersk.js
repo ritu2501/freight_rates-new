@@ -20,12 +20,22 @@ const { v4: uuidv4 } = require('uuid');
 const PROFILE_DIR = path.join(__dirname, '..', '..', '.maersk-profile');
 const SNAPSHOT_DIR = path.join(__dirname, '..', '..', 'snapshots');
 const BOOK_URL = 'https://www.maersk.com/book/';
-const ENCRYPTION_KEY = process.env.SNAPSHOT_KEY || 'change-me-in-production-32chars!';
 const DEFAULT_TIMEOUT = parseInt(process.env.SCRAPER_TIMEOUT_MS, 10) || 60000;
 
-// Maersk Login Credentials (from .env or defaults)
-const MAERSK_USERNAME = process.env.MAERSK_USERNAME || 'Eximsingpore';
-const MAERSK_PASSWORD = process.env.MAERSK_PASSWORD || 'Qwerty@12345';
+// Validate required environment variables
+function validateEnvironment() {
+  const required = ['SNAPSHOT_KEY', 'MAERSK_USERNAME', 'MAERSK_PASSWORD'];
+  const missing = required.filter(key => !process.env[key] || process.env[key].includes('your_'));
+  
+  if (missing.length > 0) {
+    throw new Error(`[SCRAPER] Missing required environment variables: ${missing.join(', ')}. Please update .env file with actual values.`);
+  }
+}
+
+// Maersk Login Credentials (from .env - must be set)
+const MAERSK_USERNAME = process.env.MAERSK_USERNAME;
+const MAERSK_PASSWORD = process.env.MAERSK_PASSWORD;
+const ENCRYPTION_KEY = process.env.SNAPSHOT_KEY;
 
 // Ensure directories exist
 if (!fs.existsSync(PROFILE_DIR)) fs.mkdirSync(PROFILE_DIR, { recursive: true });
@@ -55,31 +65,41 @@ function simulateScrape(params) {
 
   console.log(`[Scraper SIM] Job ${job_id} | ${from_port} → ${to_port} | ${container_type}`);
 
-  // Simulate some delay
+  // Generate multiple candidates with different dates and prices
+  const candidates = [];
   const basePrice = 1500 + Math.floor(Math.random() * 2000);
-  const transitDays = 10 + Math.floor(Math.random() * 25);
-  const validUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  
+  // Create 3 options with different dates
+  for (let i = 0; i < 3; i++) {
+    const departureDate = new Date(Date.now() + (i + 1) * 2 * 24 * 60 * 60 * 1000); // 2, 4, 6 days from now
+    const price = basePrice + (i * 200) - 200; // vary prices
+    const transitDays = 10 + Math.floor(Math.random() * 15) + (i * 2);
+    const validUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const confidenceVariation = 0.95 - (i * 0.05); // Slightly lower confidence for later dates
 
-  const candidate = {
-    price: basePrice,
-    total_price: basePrice,
-    ocean_freight: Math.round(basePrice * 0.75),
-    origin_thc: Math.round(basePrice * 0.1),
-    destination_thc: Math.round(basePrice * 0.1),
-    origin_misc: Math.round(basePrice * 0.05),
-    currency: 'USD',
-    transit_days: transitDays,
-    service_type: 'STANDARD',
-    carrier: 'Maersk',
-    valid_until: validUntil,
-    confidence_score: 0.85,
-    snapshot_id: null,
-  };
+    const candidate = {
+      price: price,
+      total_price: price,
+      ocean_freight: Math.round(price * 0.75),
+      origin_thc: Math.round(price * 0.1),
+      destination_thc: Math.round(price * 0.1),
+      origin_misc: Math.round(price * 0.05),
+      currency: 'USD',
+      transit_days: transitDays,
+      service_type: 'STANDARD',
+      carrier: 'Maersk',
+      departure_date: departureDate.toISOString().split('T')[0], // YYYY-MM-DD
+      valid_until: validUntil,
+      confidence_score: confidenceVariation,
+      snapshot_id: null,
+    };
+    candidates.push(candidate);
+  }
 
   return {
     status: 'SUCCESS',
     source: 'SIMULATION',
-    candidates: [candidate],
+    candidates: candidates,
     snapshot_id: null,
   };
 }
@@ -1337,6 +1357,7 @@ async function extractPricingCandidates(page, snapshotId) {
 module.exports = {
   simulateScrape,
   scrapeMaerskSpotRate,
+  validateEnvironment,
 };
 
 // Export helpers for testing
@@ -1345,3 +1366,10 @@ module.exports.waitForVisibleWithRetries = waitForVisibleWithRetries;
 module.exports.detectConsent = detectConsent;
 module.exports.detectAccessDenied = detectAccessDenied;
 module.exports.isBookingVisible = isBookingVisible;
+
+// Validate environment on module load (can be called explicitly before use)
+try {
+  validateEnvironment();
+} catch (err) {
+  console.warn('[SCRAPER] Environment validation warning:', err.message);
+}

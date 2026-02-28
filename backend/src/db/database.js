@@ -10,6 +10,7 @@ const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, '..', '..', 'f
 
 let _db = null;
 let _ready = null;
+let _initInProgress = false;
 
 /**
  * Wrapper that mimics better-sqlite3-style API on top of sql.js
@@ -90,7 +91,13 @@ class DbWrapper {
       const buffer = Buffer.from(data);
       fs.writeFileSync(DB_PATH, buffer);
     } catch (err) {
-      console.error('[DB] Save error:', err.message);
+      console.error('[DB] Save error:', {
+        message: err.message,
+        code: err.code,
+        path: DB_PATH,
+        stack: err.stack
+      });
+      throw err; // Propagate error so caller knows about it
     }
   }
 }
@@ -115,10 +122,34 @@ function getDb() {
 }
 
 async function initDbAsync() {
-  if (!_ready) {
-    _ready = initDb().then((w) => { _db = w; return w; });
+  // Prevent multiple simultaneous init calls
+  if (_ready) return _ready;
+  
+  if (_initInProgress) {
+    // Wait for the in-progress initialization
+    return new Promise((resolve) => {
+      const checkReady = setInterval(() => {
+        if (_db) {
+          clearInterval(checkReady);
+          resolve(_db);
+        }
+      }, 50);
+    });
   }
-  return _ready;
+
+  _initInProgress = true;
+  try {
+    _ready = initDb().then((w) => {
+      _db = w;
+      console.log('[DB] Database initialized successfully');
+      return w;
+    });
+    return _ready;
+  } catch (err) {
+    _initInProgress = false;
+    console.error('[DB] Failed to initialize database:', err.message);
+    throw err;
+  }
 }
 
 function initTables(db) {
